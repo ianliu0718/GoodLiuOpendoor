@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="zh-tw">
+<head>
+    <meta charset="UTF-8">
+    <title>智慧門鎖控制</title>
+    <style>
+        body { 
+            font-family: Arial, sans-serif; 
+            text-align: center; 
+            padding: 50px; 
+            background-color: #f5f5f5;
+        }
+        input { 
+            margin: 10px; 
+            padding: 10px; 
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        button { 
+            padding: 10px 20px; 
+            background: #4CAF50; 
+            color: white; 
+            border: none; 
+            cursor: pointer;
+            border-radius: 4px;
+            font-size: 16px;
+        }
+        button:hover { 
+            background: #45a049; 
+        }
+        #status { 
+            margin-top: 20px; 
+            font-weight: bold;
+            min-height: 24px;
+        }
+        .form-section {
+            margin-top: 40px; 
+            padding: 20px; 
+            border: 1px solid #ddd; 
+            border-radius: 5px; 
+            max-width: 500px; 
+            margin-left: auto; 
+            margin-right: auto;
+            background-color: white;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .form-section h3 {
+            margin-top: 0;
+            color: #333;
+        }
+        .form-group {
+            text-align: left; 
+            margin: 15px 0;
+        }
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            color: #555;
+            font-weight: bold;
+        }
+        .form-group input {
+            width: 100%;
+            box-sizing: border-box;
+            margin: 0;
+        }
+        .info-text {
+            font-size: 12px;
+            color: #888;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+    <h1>智慧門鎖控制系統</h1>
+    <div id="login">
+        <h2>登入</h2>
+        <input type="text" id="username" placeholder="使用者名稱"><br>
+        <input type="password" id="password" placeholder="密碼"><br>
+        <button onclick="login()">登入</button>
+    </div>
+    <div id="control" style="display: none;">
+        <h2>歡迎！</h2>
+        <button onclick="openDoor()">開門</button>
+        
+        <div class="form-section">
+            <h3>新增臨時密碼</h3>
+            <div class="form-group">
+                <label for="tempPw">密碼 <span style="color: red;">*</span></label>
+                <input type="text" id="tempPw" placeholder="例如: 1234" maxlength="8" pattern="[0-9]*" inputmode="numeric">
+                <div class="info-text">1-8位數字，必填</div>
+            </div>
+            <div class="form-group">
+                <label for="expireTime">到期時間 (選填)</label>
+                <input type="datetime-local" id="expireTime">
+                <div class="info-text">留空表示無期限</div>
+            </div>
+            <div class="form-group">
+                <label for="useCount">使用次數 (選填)</label>
+                <input type="number" id="useCount" placeholder="例如: 5" min="-1" value="">
+                <div class="info-text">-1 表示無限制，留空表示無限制</div>
+            </div>
+            <button onclick="addTempPassword()" style="margin-top: 10px; width: 100%;">新增臨時密碼</button>
+        </div>
+    </div>
+    <div id="status"></div>
+
+    <script>
+        let token = '';
+
+        function login() {
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            fetch('https://liunas2323.synology.me/api/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, password })
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    token = data.token;
+                    document.getElementById('login').style.display = 'none';
+                    document.getElementById('control').style.display = 'block';
+                    document.getElementById('status').textContent = '登入成功';
+                } else {
+                    document.getElementById('status').textContent = '登入失敗';
+                }
+            });
+        }
+
+        function openDoor() {
+            fetch('https://liunas2323.synology.me/api/open', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ token })
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    document.getElementById('status').textContent = '門已開啟';
+                    document.getElementById('status').style.color = 'green';
+                } else {
+                    document.getElementById('status').textContent = '開門失敗';
+                    document.getElementById('status').style.color = 'red';
+                }
+            })
+            .catch(err => {
+                document.getElementById('status').textContent = '開門請求失敗: ' + err;
+                document.getElementById('status').style.color = 'red';
+            });
+        }
+
+        function addTempPassword() {
+            const pw = document.getElementById('tempPw').value.trim();
+            const expireTime = document.getElementById('expireTime').value;
+            const useCount = document.getElementById('useCount').value;
+            
+            // 驗證密碼
+            if (!pw || pw.length === 0) {
+                document.getElementById('status').textContent = '請輸入密碼';
+                document.getElementById('status').style.color = 'red';
+                return;
+            }
+            
+            if (pw.length > 8) {
+                document.getElementById('status').textContent = '密碼長度不能超過8位';
+                document.getElementById('status').style.color = 'red';
+                return;
+            }
+            
+            if (!/^\d+$/.test(pw)) {
+                document.getElementById('status').textContent = '密碼只能包含數字';
+                document.getElementById('status').style.color = 'red';
+                return;
+            }
+            
+            // 準備請求數據
+            const requestData = { token };
+            requestData.pw = pw;
+            
+            // 處理到期時間（將 datetime-local 格式轉換為 YYYY-MM-DDTHH:MM）
+            if (expireTime && expireTime.trim().length > 0) {
+                // datetime-local 格式已經是 YYYY-MM-DDTHH:MM，直接使用
+                requestData.expire = expireTime.substring(0, 16); // 確保格式正確
+            }
+            
+            // 處理使用次數
+            if (useCount && useCount.trim().length > 0) {
+                const count = parseInt(useCount);
+                if (!isNaN(count) && count >= -1) {
+                    requestData.count = count;
+                } else {
+                    document.getElementById('status').textContent = '使用次數必須是數字且 >= -1';
+                    document.getElementById('status').style.color = 'red';
+                    return;
+                }
+            }
+            
+            // 發送請求
+            document.getElementById('status').textContent = '正在新增臨時密碼...';
+            document.getElementById('status').style.color = 'blue';
+            
+            fetch('https://liunas2323.synology.me/api/add_temp_pw', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(requestData)
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    document.getElementById('status').textContent = '臨時密碼新增成功！';
+                    document.getElementById('status').style.color = 'green';
+                    // 清空表單
+                    document.getElementById('tempPw').value = '';
+                    document.getElementById('expireTime').value = '';
+                    document.getElementById('useCount').value = '';
+                } else {
+                    document.getElementById('status').textContent = '新增失敗: ' + (data.error || '未知錯誤');
+                    document.getElementById('status').style.color = 'red';
+                }
+            })
+            .catch(err => {
+                document.getElementById('status').textContent = '請求失敗: ' + err;
+                document.getElementById('status').style.color = 'red';
+            });
+        }
+    </script>
+</body>
+</html>
