@@ -1,4 +1,4 @@
-// v1.1.5 - 修正：MQTT 連線問題
+// v1.1.6 - 修正：MQTT 連線問題
 // ESP32 智慧門鎖主控程式
 // 功能：指紋辨識、密碼開鎖、遠端HTTP開鎖
 // 材料：ESP32 DEVKIT V1、AS608、4x4 Keypad、繼電器
@@ -43,7 +43,6 @@ Preferences preferences;
 // 指紋模組設定 - 使用專用腳位，不共用
 #define FINGER_RX 16  // GPIO 16
 #define FINGER_TX 17  // GPIO 17
-#define FINGER_LED 23 // GPIO 23 (指紋機 LED 控制)
 HardwareSerial fingerSerial(1); // 使用 UART2
 Adafruit_Fingerprint finger = Adafruit_Fingerprint(&fingerSerial);
 
@@ -387,10 +386,6 @@ void initFingerprint() {
   // 初始化指紋偵測為關閉
   inFingerRun = false;
   
-  // 設定指紋機 LED 腳位
-  pinMode(FINGER_LED, OUTPUT);
-  digitalWrite(FINGER_LED, LOW); // 預設關閉
-  
   // 初始化指紋機通訊
   fingerSerial.begin(57600, SERIAL_8N1, FINGER_RX, FINGER_TX);
   delay(1000);
@@ -398,19 +393,9 @@ void initFingerprint() {
   if (finger.verifyPassword()) {
     Serial.println("指紋機連接成功");
     fingerAvailable = true;
-    digitalWrite(FINGER_LED, HIGH); // 連接成功亮燈
-    delay(500);
-    digitalWrite(FINGER_LED, LOW);
   } else {
     Serial.println("指紋機連接失敗");
     fingerAvailable = false;
-    // 閃爍 LED 表示錯誤
-    for (int i = 0; i < 3; i++) {
-      digitalWrite(FINGER_LED, HIGH);
-      delay(200);
-      digitalWrite(FINGER_LED, LOW);
-      delay(200);
-    }
   }
 }
 
@@ -418,8 +403,6 @@ void initFingerprint() {
 void checkFingerprint() {
   if (!fingerAvailable) return;
   
-  // 點亮指紋機 LED
-  digitalWrite(FINGER_LED, HIGH);
   finger.LEDcontrol(true);
   
   // 顯示指紋辨識狀態，短暫顯示以提示使用者可以掃描
@@ -429,7 +412,6 @@ void checkFingerprint() {
   int result = finger.getImage();
   if (result == FINGERPRINT_NOFINGER) {
     // 沒有手指，關閉 LED 並返回
-    digitalWrite(FINGER_LED, LOW);
     finger.LEDcontrol(false);
     return;
   }
@@ -438,32 +420,28 @@ void checkFingerprint() {
     // 顯示處理中
     showTextOnLed("Proc", 500);
     
-    if (finger.image2Tz(1) == FINGERPRINT_OK) {
+    if (finger.image2Tz() == FINGERPRINT_OK) {
       result = finger.fingerSearch();
       if (result == FINGERPRINT_OK) {
         Serial.println("指紋辨識通過，開門");
-        digitalWrite(FINGER_LED, LOW);
         finger.LEDcontrol(false);
         showResult('O'); // 顯示成功
         openLock();
         delay(2000); // 防止重複觸發
       } else {
         Serial.println("指紋不符");
-        digitalWrite(FINGER_LED, LOW);
         finger.LEDcontrol(false);
-        showResult('E'); // 顯示錯誤
+        showErrorNoOnLed(11); // 顯示錯誤
       }
     } else {
       Serial.println("指紋圖像處理失敗");
-      digitalWrite(FINGER_LED, LOW);
       finger.LEDcontrol(false);
-      showResult('E'); // 顯示錯誤
+      showErrorNoOnLed(12); // 顯示錯誤
     }
   } else {
     Serial.println("指紋圖像獲取失敗");
-    digitalWrite(FINGER_LED, LOW);
     finger.LEDcontrol(false);
-    showResult('E'); // 顯示錯誤
+    showErrorNoOnLed(13); // 顯示錯誤
   }
   
   // 關閉指紋機
@@ -475,9 +453,6 @@ void checkFingerprint() {
 // 指紋註冊函式
 bool enrollFingerprint(int id) {
   if (!fingerAvailable) return false;
-  
-  digitalWrite(FINGER_LED, HIGH);
-  
   // 顯示註冊狀態
   showTextOnLed("Enroll", 2000);
   
@@ -485,12 +460,10 @@ bool enrollFingerprint(int id) {
   Serial.print("請放上手指...");
   
   if (finger.getImage() != FINGERPRINT_OK) {
-    digitalWrite(FINGER_LED, LOW);
     return false;
   }
   
   if (finger.image2Tz(1) != FINGERPRINT_OK) {
-    digitalWrite(FINGER_LED, LOW);
     return false;
   }
   
@@ -498,22 +471,18 @@ bool enrollFingerprint(int id) {
   delay(2000);
   
   if (finger.getImage() != FINGERPRINT_OK) {
-    digitalWrite(FINGER_LED, LOW);
     return false;
   }
   
   if (finger.image2Tz(2) != FINGERPRINT_OK) {
-    digitalWrite(FINGER_LED, LOW);
     return false;
   }
   
   if (finger.createModel() != FINGERPRINT_OK) {
-    digitalWrite(FINGER_LED, LOW);
     return false;
   }
   
   if (finger.storeModel(id) != FINGERPRINT_OK) {
-    digitalWrite(FINGER_LED, LOW);
     return false;
   }
   
@@ -524,7 +493,6 @@ bool enrollFingerprint(int id) {
   }
   
   finger.LEDcontrol(false);
-  digitalWrite(FINGER_LED, LOW);
   
   // 顯示成功
   showResult('O');
@@ -535,9 +503,7 @@ bool enrollFingerprint(int id) {
 bool deleteFingerprint(int id) {
   if (!fingerAvailable) return false;
   
-  digitalWrite(FINGER_LED, HIGH);
   bool result = finger.deleteModel(id) == FINGERPRINT_OK;
-  digitalWrite(FINGER_LED, LOW);
   
   if (result) {
     removeFingerprintId(id);
@@ -763,7 +729,7 @@ int addTempPassword(String pw, String expireStr = "", int count = -1) {
   // 檢查密碼格式（只能包含數字，長度1-8）
   if (pw.length() > 8) {
     Serial.println("密碼長度超過8位");
-    showErrorNoOnLed(5);
+    showErrorNoOnLed(14);
     return 3;
   }
   
@@ -785,14 +751,14 @@ int addTempPassword(String pw, String expireStr = "", int count = -1) {
     // 驗證時間格式: YYYY-MM-DDTHH:MM (至少16個字符)
     if (expireStr.length() < 16) {
       Serial.println("時間格式錯誤: 長度不足");
-      showErrorNoOnLed(5);
+      showErrorNoOnLed(15);
       return 4;
     }
     // 檢查基本格式
     if (expireStr.charAt(4) != '-' || expireStr.charAt(7) != '-' || 
         expireStr.charAt(10) != 'T' || expireStr.charAt(13) != ':') {
       Serial.println("時間格式錯誤: 格式不符");
-      showErrorNoOnLed(5);
+      showErrorNoOnLed(18);
       return 4;
     }
     tp.expireTime = parseTime(expireStr);
@@ -800,7 +766,7 @@ int addTempPassword(String pw, String expireStr = "", int count = -1) {
     unsigned long now = getNow();
     if (tp.expireTime < now - 86400) { // 如果時間比現在早超過1天，可能是解析錯誤
       Serial.println("時間格式錯誤: 時間過早");
-      showErrorNoOnLed(5);
+      showErrorNoOnLed(19);
       return 4;
     }
   } else {
@@ -828,7 +794,7 @@ int addTempPassword(String pw, String expireStr = "", int count = -1) {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("ESP32 智慧門鎖 v1.1.5");
+  Serial.println("ESP32 智慧門鎖 v1.1.6");
   
   Serial.println("初始化伺服馬達...");
   safeServoAttach();
@@ -842,7 +808,7 @@ void setup() {
   initMax7219();
   
   // 簡單測試 MAX7219 是否工作
-  showversion("v1.1.5", 1000);
+  showversion("v1.1.6", 1000);
   clearDisplay();
   
   // 增加按鍵去抖動時間，嘗試解決鬼鍵問題
@@ -899,19 +865,11 @@ void setup() {
   Serial.println("\nNTP 校時完成");
   // ====================
 
-  // HTTP 遠端開門 (添加密碼認證)
+  // HTTP 遠端開門
   server.on("/open", HTTP_GET, []() {
-    if (!server.hasArg("pw")) {
-      server.send(400, "text/plain", "缺少密碼參數 pw");
-      return;
-    }
-    String pw = server.arg("pw");
-    if (pw == correct_password) {
-      openLock();
-      server.send(200, "text/plain", "OK");
-    } else {
-      server.send(401, "text/plain", "密碼錯誤");
-    }
+    openLock();
+    clearDisplay();
+    server.send(200, "text/plain", "OK");
   });
 
   // 主密碼變更API
@@ -1140,7 +1098,6 @@ void loop() {
     checkFingerprint();
   } else {
     // 未在指紋偵測模式時，確保 LED 關閉
-    digitalWrite(FINGER_LED, LOW);
     if (fingerAvailable) finger.LEDcontrol(false);
   }
   
@@ -1240,7 +1197,6 @@ void checkKeypad() {
         showTextOnLed("FPOF    ", 1000);
         clearDisplay();
         // 關閉指紋機 LED（閒置時不亮）
-        digitalWrite(FINGER_LED, LOW);
         finger.LEDcontrol(false);
       }
     } else if (key == 'B') {
@@ -1317,7 +1273,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     if (error) {
       Serial.print("JSON 解析失敗: ");
       Serial.println(error.c_str());
-      showErrorNoOnLed(11); // 使用錯誤編號 11 表示 JSON 解析錯誤
+      showErrorNoOnLed(17); // 使用錯誤編號 11 表示 JSON 解析錯誤
       return;
     }
     
@@ -1375,4 +1331,4 @@ void reconnectMQTT() {
   }
 }
 
-// v1.1.5
+// v1.1.6
