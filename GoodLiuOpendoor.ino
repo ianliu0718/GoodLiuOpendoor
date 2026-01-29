@@ -1,4 +1,4 @@
-// v1.1.7 - 修正：WebServer/MQTT 穩定性、加入診斷機制
+// v1.1.8 - 修正：加入 WiFi 自動重連機制
 // ESP32 智慧門鎖主控程式
 // 功能：指紋辨識、密碼開鎖、遠端HTTP開鎖、MQTT遠端控制
 // 材料：ESP32 DEVKIT V1、AS608、4x4 Keypad、繼電器
@@ -809,8 +809,8 @@ int addTempPassword(String pw, String expireStr = "", int count = -1) {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n\n=== ESP32 智慧門鎖 v1.1.7 ===");
-  Serial.println("版本說明: 修正WebServer/MQTT穩定性、加入診斷機制");
+  Serial.println("\n\n=== ESP32 智慧門鎖 v1.1.8 ===");
+  Serial.println("版本說明: 加入 WiFi 自動重連機制、改進 WebServer/MQTT 穩定性");
   
   // 初始化診斷狀態
   diag.wifi_connected = false;
@@ -833,7 +833,7 @@ void setup() {
   initMax7219();
   
   // 簡單測試 MAX7219 是否工作
-  showversion("v1.1.6", 1000);
+  showversion("v1.1.8", 1000);
   clearDisplay();
   
   // 增加按鍵去抖動時間，嘗試解決鬼鍵問題
@@ -1166,14 +1166,39 @@ void setup() {
   loadTempPasswordsFromPreferences(); // ← 開機時載入臨時密碼
 }
 
+// WiFi 重連相關變數
+unsigned long lastWiFiReconnectAttempt = 0;
+const unsigned long WIFI_RECONNECT_INTERVAL = 10000; // WiFi 每10秒嘗試一次重連
+
 void loop() {
   // === 持續處理 HTTP 請求（必須頻繁調用避免阻塞） ===
   if (diag.http_server_running) {
     server.handleClient(); // 每個 loop 都要處理，避免客戶端超時
   }
   
-  // === WiFi 狀態監測與修復 ===
-  diag.wifi_connected = (WiFi.status() == WL_CONNECTED);
+  // === WiFi 狀態監測與自動重連 ===
+  bool currentWiFiStatus = (WiFi.status() == WL_CONNECTED);
+  
+  if (!inSetupMode) {
+    if (!currentWiFiStatus) {
+      // WiFi 已斷線，嘗試重連（每10秒最多一次）
+      if (millis() - lastWiFiReconnectAttempt > WIFI_RECONNECT_INTERVAL) {
+        Serial.println("[WiFi] ⚠️ WiFi 已斷開，嘗試重新連接...");
+        WiFi.reconnect();  // ESP32 WiFi 函式，自動使用已保存的 SSID/Password
+        lastWiFiReconnectAttempt = millis();
+      }
+    } else if (!diag.wifi_connected) {
+      // WiFi 剛連上（從斷線狀態恢復）
+      Serial.println("[WiFi] ✅ WiFi 已重新連接");
+      // 立即嘗試重連 MQTT
+      if (!client.connected()) {
+        Serial.println("[WiFi] 觸發 MQTT 重連");
+        diag.last_mqtt_attempt = 0;  // 重置 MQTT 重連計時器，立即嘗試
+      }
+    }
+  }
+  
+  diag.wifi_connected = currentWiFiStatus;
   
   // === MQTT 連線管理（改進版，避免無限重試） ===
   if (!inSetupMode && diag.wifi_connected) {
@@ -1462,4 +1487,4 @@ void reconnectMQTT() {
   }
 }
 
-// v1.1.7 - 修正完成
+// v1.1.8 - WiFi 自動重連完成
