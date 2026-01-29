@@ -1,6 +1,6 @@
-// v1.1.6 - 修正：MQTT 連線問題
+// v1.1.7 - 修正：WebServer/MQTT 穩定性、加入診斷機制
 // ESP32 智慧門鎖主控程式
-// 功能：指紋辨識、密碼開鎖、遠端HTTP開鎖
+// 功能：指紋辨識、密碼開鎖、遠端HTTP開鎖、MQTT遠端控制
 // 材料：ESP32 DEVKIT V1、AS608、4x4 Keypad、繼電器
 
 #include <WiFi.h>
@@ -15,6 +15,18 @@
 #include <MD_MAX72xx.h> // 使用 MD_MAX72XX 庫
 #include <Preferences.h>
 #include <time.h> // 新增 NTP 校時
+
+// ===== 診斷機制 =====
+struct DiagnosticState {
+  bool wifi_connected = false;
+  bool mqtt_connected = false;
+  bool http_server_running = false;
+  unsigned long last_mqtt_attempt = 0;
+  unsigned long last_http_request = 0;
+  int mqtt_reconnect_count = 0;
+  int http_request_count = 0;
+};
+DiagnosticState diag;
 
 // WiFi 設定
 #define SSID_ADDR 0
@@ -567,6 +579,7 @@ void connectToWiFi() {
     Serial.println("\nWiFi 連線成功");
     Serial.print("IP: ");
     Serial.println(WiFi.localIP());
+    diag.wifi_connected = true;
     IPAddress ip = WiFi.localIP();
     String ipArr[4];
     ipArr[0] = String(ip[0]);
@@ -583,11 +596,13 @@ void connectToWiFi() {
     showTextOnLed(group1 + group2, 3000);
   } else {
     Serial.println("\nWiFi 連線失敗，啟動AP模式");
+    diag.wifi_connected = false;
     inSetupMode = true;
     WiFi.softAP("Lock_Setup_AP", "password");
     server.on("/", HTTP_GET, handleRoot);
     server.on("/save", HTTP_POST, handleSave);
     server.begin();
+    diag.http_server_running = true;
     showTextOnLed("AP     ", 3000);
     IPAddress apIP = WiFi.softAPIP();
     Serial.print("AP模式啟動，請連接WiFi並設定，AP IP: ");
@@ -794,7 +809,17 @@ int addTempPassword(String pw, String expireStr = "", int count = -1) {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("ESP32 智慧門鎖 v1.1.6");
+  Serial.println("\n\n=== ESP32 智慧門鎖 v1.1.7 ===");
+  Serial.println("版本說明: 修正WebServer/MQTT穩定性、加入診斷機制");
+  
+  // 初始化診斷狀態
+  diag.wifi_connected = false;
+  diag.mqtt_connected = false;
+  diag.http_server_running = false;
+  diag.last_mqtt_attempt = 0;
+  diag.last_http_request = 0;
+  diag.mqtt_reconnect_count = 0;
+  diag.http_request_count = 0;
   
   Serial.println("初始化伺服馬達...");
   safeServoAttach();
@@ -832,6 +857,7 @@ void setup() {
     server.on("/", HTTP_GET, handleRoot);
     server.on("/save", HTTP_POST, handleSave);
     server.begin();
+    diag.http_server_running = true;
     showTextOnLed("AP     ", 3000);
     IPAddress apIP = WiFi.softAPIP();
     Serial.print("AP模式啟動，請連接WiFi並設定，AP IP: ");
@@ -1006,6 +1032,56 @@ void setup() {
     server.send(200, "text/plain", "OK");
   });
 
+  // ===== 診斷 API ===== 
+  server.on("/status", HTTP_GET, []() {
+    diag.last_http_request = millis();
+    String json = "{";
+    json += "\"wifi\":" + String(diag.wifi_connected ? "true" : "false") + ",";
+    json += "\"mqtt\":" + String(diag.mqtt_connected ? "true" : "false") + ",";
+    json += "\"http_server\":" + String(diag.http_server_running ? "true" : "false") + ",";
+    json += "\"http_requests\":" + String(diag.http_request_count) + ",";
+    json += "\"mqtt_reconnects\":" + String(diag.mqtt_reconnect_count) + ",";
+    json += "\"uptime_ms\":" + String(millis()) + ",";
+    json += "\"last_http_ms\":" + String(diag.last_http_request);
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/debug", HTTP_GET, []() {
+    diag.last_http_request = millis();
+    String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>除錯診斷</title><meta http-equiv='refresh' content='5'></head><body>";
+    html += "<h2>🔧 系統除錯診斷頁面</h2>";
+    html += "<p>此頁面每5秒自動刷新。</p>";
+    html += "<table border='1' cellpadding='10'>";
+    
+    html += "<tr><td><b>WiFi 狀態</b></td><td>" + String(diag.wifi_connected ? "✅ 已連接" : "❌ 未連接") + "</td></tr>";
+    if (diag.wifi_connected) {
+      html += "<tr><td><b>本機 IP</b></td><td>" + WiFi.localIP().toString() + "</td></tr>";
+      html += "<tr><td><b>信號強度</b></td><td>" + String(WiFi.RSSI()) + " dBm</td></tr>";
+    }
+    
+    html += "<tr><td><b>MQTT 狀態</b></td><td>" + String(diag.mqtt_connected ? "✅ 已連接" : "❌ 已斷開") + "</td></tr>";
+    html += "<tr><td><b>MQTT 重連計數</b></td><td>" + String(diag.mqtt_reconnect_count) + "</td></tr>";
+    
+    html += "<tr><td><b>HTTP Server</b></td><td>" + String(diag.http_server_running ? "✅ 運行" : "❌ 停止") + "</td></tr>";
+    html += "<tr><td><b>HTTP 請求計數</b></td><td>" + String(diag.http_request_count) + "</td></tr>";
+    
+    unsigned long uptime = millis() / 1000;
+    unsigned long days = uptime / 86400;
+    unsigned long hours = (uptime % 86400) / 3600;
+    unsigned long minutes = (uptime % 3600) / 60;
+    unsigned long seconds = uptime % 60;
+    html += "<tr><td><b>運行時間</b></td><td>" + String(days) + "d " + String(hours) + "h " + String(minutes) + "m " + String(seconds) + "s</td></tr>";
+    
+    html += "<tr><td><b>自由 RAM</b></td><td>" + String(ESP.getFreeHeap()) + " bytes</td></tr>";
+    html += "<tr><td><b>指紋模組</b></td><td>" + String(fingerAvailable ? "✅ 就位" : "❌ 未連接") + "</td></tr>";
+    
+    html += "</table>";
+    html += "<br><button onclick=\"location.reload()\">手動重整</button>";
+    html += "</body></html>";
+    server.send(200, "text/html", html);
+  });
+
   // 伺服角度 API：讀取與設定
   server.on("/get_servo_angle", HTTP_GET, []() {
     server.send(200, "application/json", String("{\"angle\":" + String(servoOpenAngle) + "}"));
@@ -1021,8 +1097,18 @@ void setup() {
   });
   
   server.on("/", HTTP_GET, []() {
+    diag.last_http_request = millis();
+    diag.http_request_count++;
     String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>智慧門鎖控制</title></head><body>";
     html += "<h2>智慧門鎖控制面板</h2>";
+    html += "<div style='background-color:#eee; padding:10px; margin:10px 0; border-radius:5px;'>";
+    html += "<h3>📊 系統診斷</h3>";
+    html += "<p><b>WiFi 狀態:</b> " + String(diag.wifi_connected ? "✅ 已連接" : "❌ 未連接") + "</p>";
+    html += "<p><b>MQTT 狀態:</b> " + String(diag.mqtt_connected ? "✅ 已連接" : "❌ 未連接") + "</p>";
+    html += "<p><b>HTTP Server:</b> " + String(diag.http_server_running ? "✅ 運行中" : "❌ 已停止") + "</p>";
+    html += "<p><b>HTTP 請求數:</b> " + String(diag.http_request_count) + "</p>";
+    html += "<p><b>MQTT 重連次數:</b> " + String(diag.mqtt_reconnect_count) + "</p>";
+    html += "</div>";
     html += "<button onclick=\"fetch('/open').then(r=>alert('已開鎖'))\">開鎖</button><br><br>";
     html += "<h3>開門角度</h3>";
     html += "<button onclick=\"adjAngle(-1)\">-1</button> ";
@@ -1061,15 +1147,16 @@ void setup() {
   });
   
   server.begin();
+  diag.http_server_running = true;
 
   // 初始化 MQTT（僅在 WiFi 連接成功時）
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("WiFi 已連接，初始化 MQTT...");
+    Serial.println("[SETUP] WiFi 已連接，初始化 MQTT...");
     client.setServer(mqtt_server, mqtt_port);
     client.setCallback(mqttCallback);
     reconnectMQTT();
   } else {
-    Serial.println("WiFi 未連接，跳過 MQTT 初始化");
+    Serial.println("[SETUP] WiFi 未連接，跳過 MQTT 初始化，將於 loop 中自動重試");
   }
 
   //顯示oooo代表完成，可輸入密碼。
@@ -1080,15 +1167,31 @@ void setup() {
 }
 
 void loop() {
-  server.handleClient();
+  // === 持續處理 HTTP 請求（必須頻繁調用避免阻塞） ===
+  if (diag.http_server_running) {
+    server.handleClient(); // 每個 loop 都要處理，避免客戶端超時
+  }
   
-  // 僅在 WiFi 連接成功且不在設置模式時處理 MQTT
-  if (!inSetupMode && WiFi.status() == WL_CONNECTED) {
-    if (!client.connected()) {
-      showErrorNoOnLed(16);
+  // === WiFi 狀態監測與修復 ===
+  diag.wifi_connected = (WiFi.status() == WL_CONNECTED);
+  
+  // === MQTT 連線管理（改進版，避免無限重試） ===
+  if (!inSetupMode && diag.wifi_connected) {
+    // 定期檢查 MQTT 連線，如果斷開則嘗試重連（每5秒最多一次）
+    if (!client.connected() && (millis() - diag.last_mqtt_attempt > 5000)) {
+      Serial.println("[MQTT] 連線已斷開，嘗試重連...");
+      diag.mqtt_reconnect_count++;
+      diag.last_mqtt_attempt = millis();
       reconnectMQTT();
     }
-    client.loop();
+    
+    // 只在連接時才調用 loop，避免非連接狀態下的堆積
+    if (client.connected()) {
+      diag.mqtt_connected = true;
+      client.loop();
+    } else {
+      diag.mqtt_connected = false;
+    }
   }
   
   if (inSetupMode) return;
@@ -1304,31 +1407,59 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
 }
 
-// MQTT 重連函數
+// MQTT 重連函數 - 改進版，設定重連次數上限避免無限重試
 void reconnectMQTT() {
   // 檢查 WiFi 連接狀態
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi 未連接，無法連接 MQTT");
+    Serial.println("[MQTT] WiFi 未連接，無法連接 MQTT");
+    diag.mqtt_connected = false;
     return;
   }
   
-  while (!client.connected()) {
-    Serial.print("Attempting MQTT connection...");
-    if (client.connect("ESP32Client", mqtt_user, mqtt_pass)) {
-      Serial.println("connected");
-      Serial.print("訂閱 topic: ");
+  // 防止無限重連：每次嘗試最多2次，間隔5秒
+  int attemptCount = 0;
+  const int MAX_ATTEMPTS = 2;
+  
+  while (!client.connected() && attemptCount < MAX_ATTEMPTS) {
+    attemptCount++;
+    Serial.print("[MQTT] 嘗試連接 (");
+    Serial.print(attemptCount);
+    Serial.print("/");
+    Serial.print(MAX_ATTEMPTS);
+    Serial.print(") 至 ");
+    Serial.print(mqtt_server);
+    Serial.print(":");
+    Serial.println(mqtt_port);
+    
+    if (client.connect("ESP32_Door", mqtt_user, mqtt_pass)) {
+      Serial.println("[MQTT] ✅ 連接成功");
+      diag.mqtt_connected = true;
+      
+      // 訂閱主題
+      Serial.print("[MQTT] 訂閱 topic: ");
       Serial.println(mqtt_topic);
       client.subscribe(mqtt_topic);
-      Serial.print("訂閱 topic: ");
+      
+      Serial.print("[MQTT] 訂閱 topic: ");
       Serial.println(mqtt_topic_add_temp_pw);
       client.subscribe(mqtt_topic_add_temp_pw);
+      
+      return;
     } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
-      delay(5000);
+      Serial.print("[MQTT] ❌ 連接失敗，狀態碼: ");
+      Serial.println(client.state());
+      diag.mqtt_connected = false;
+      
+      if (attemptCount < MAX_ATTEMPTS) {
+        Serial.println("[MQTT] 5秒後重試...");
+        delay(5000);
+      }
     }
+  }
+  
+  if (!client.connected()) {
+    Serial.println("[MQTT] ⚠️ 已達重試上限，將於下次 loop 重新嘗試");
   }
 }
 
-// v1.1.6
+// v1.1.7 - 修正完成
