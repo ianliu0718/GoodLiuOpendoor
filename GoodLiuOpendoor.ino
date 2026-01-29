@@ -1,4 +1,4 @@
-// v1.1.8 - 修正：加入 WiFi 自動重連機制
+// v1.1.9 - 修正：優化密碼輸入延遲、改進 LED 顯示非阻塞式
 // ESP32 智慧門鎖主控程式
 // 功能：指紋辨識、密碼開鎖、遠端HTTP開鎖、MQTT遠端控制
 // 材料：ESP32 DEVKIT V1、AS608、4x4 Keypad、繼電器
@@ -25,6 +25,11 @@ struct DiagnosticState {
   unsigned long last_http_request = 0;
   int mqtt_reconnect_count = 0;
   int http_request_count = 0;
+  
+  // ===== 開門狀態追蹤 =====
+  bool last_door_action_success = false;  // 最後一次開門是否成功
+  unsigned long last_door_action_time = 0;  // 最後開門時間戳
+  String last_door_action_reason = "";    // 開門原因（HTTP/MQTT/密碼/指紋）
 };
 DiagnosticState diag;
 
@@ -83,7 +88,7 @@ String correct_password = ""; // 主要預設密碼
 String password_input = "";       //  程式修改後儲存密碼
 String currentDisplayText = "";   //  程式比對用的密碼
 unsigned long lastKeypadCheck = 0;
-const unsigned long KEYPAD_CHECK_INTERVAL = 120; // 每120ms掃描一次
+const unsigned long KEYPAD_CHECK_INTERVAL = 50; // 優化：減少至 50ms，提高反應性（原本 120ms）
 
 // SG90控制腳位
 #define SERVO_PIN 5  // ESP32 腳位
@@ -300,8 +305,17 @@ void initMax7219() {
   Serial.println("MAX7219 初始化完成");
 }
 
-// 顯示
-void showTextOnLed(String text, int delayTime = 700) {
+// ====== 優化：非阻塞式 LED 顯示 ======
+unsigned long lastLedUpdate = 0;
+const unsigned long LED_UPDATE_INTERVAL = 100;  // 100ms 更新一次，避免頻繁重繪
+unsigned long lastDisplayChangeTime = 0;
+const unsigned long DISPLAY_HOLD_TIME = 500;   // 顯示保持 500ms（不阻塞）
+bool isShowingTemporaryDisplay = false;
+
+void showTextOnLed(String text, int delayTime = 0) {
+  // delayTime = 0 時為非阻塞模式（用於密碼輸入）
+  // delayTime > 0 時為傳統模式（用於啟動、錯誤等）
+  
   Serial.println("showTextOnLed: " + text);
   mx.clear();
   
@@ -310,10 +324,14 @@ void showTextOnLed(String text, int delayTime = 700) {
     mx.setColumn(i, get7SegPattern(text[len-i-1])); 
   }
   
-  delay(delayTime);
+  lastLedUpdate = millis();
+  
+  // 只在需要阻塞時才 delay（啟動、結果顯示等）
+  if (delayTime > 0) {
+    delay(delayTime);
+  }
 }
 
-// 顯示板號（支援小數點）
 void showversion(String text, int delayTime = 700) {
   Serial.println("showVersion: " + text);
   mx.clear();
@@ -352,18 +370,21 @@ void showversion(String text, int delayTime = 700) {
   delay(delayTime);
 }
 
-// 顯示密碼在 MAX7219（右對齊，最多8碼）
+// 顯示密碼在 MAX7219（右對齊，最多8碼）- 優化版本
 void showPasswordOnLed(String pw) {
   Serial.println("密碼輸入: " + pw);
   if (pw == currentDisplayText) return; // 避免重複刷新
   currentDisplayText = pw;
-  showTextOnLed(pw);
+  // 非阻塞式更新：不使用 delay
+  showTextOnLed(pw, 0);  // ← 傳 0 表示非阻塞
+  lastDisplayChangeTime = millis();
+  isShowingTemporaryDisplay = true;
 }
 
 // 顯示錯誤編號在 MAX7219（右對齊，最多4碼）
 void showErrorNoOnLed(int no) {
   Serial.println("錯誤編號: " + String(no));
-  showTextOnLed(" Err" + String(no), 2000);
+  showTextOnLed(" Err" + String(no), 1500);  // 降低 delay 時間 2000 → 1500
   clearDisplay();
 }
 
@@ -371,9 +392,9 @@ void showErrorNoOnLed(int no) {
 void showResult(char result) {
   Serial.println("結果: " + String(result));
   if (result == 'E') {
-    showTextOnLed("Error", 2000);
+    showTextOnLed("Error", 1500);  // 降低 delay 時間 2000 → 1500
   } else {
-    showTextOnLed(String(result), 2000);
+    showTextOnLed(String(result), 1200);  // 降低 delay 時間 2000 → 1200
   }
   clearDisplay();
 }
@@ -809,8 +830,8 @@ int addTempPassword(String pw, String expireStr = "", int count = -1) {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n\n=== ESP32 智慧門鎖 v1.1.8 ===");
-  Serial.println("版本說明: 加入 WiFi 自動重連機制、改進 WebServer/MQTT 穩定性");
+  Serial.println("\n\n=== ESP32 智慧門鎖 v1.1.9 ===");
+  Serial.println("版本說明: 優化密碼輸入延遲、改進LED非阻塞式顯示、加入WiFi自動重連");
   
   // 初始化診斷狀態
   diag.wifi_connected = false;
@@ -833,7 +854,7 @@ void setup() {
   initMax7219();
   
   // 簡單測試 MAX7219 是否工作
-  showversion("v1.1.8", 1000);
+  showversion("v1.1.9", 1000);
   clearDisplay();
   
   // 增加按鍵去抖動時間，嘗試解決鬼鍵問題
@@ -893,9 +914,39 @@ void setup() {
 
   // HTTP 遠端開門
   server.on("/open", HTTP_GET, []() {
-    openLock();
+    diag.last_http_request = millis();
+    diag.http_request_count++;
+    diag.last_door_action_reason = "HTTP";
+    bool success = openLock();
     clearDisplay();
-    server.send(200, "text/plain", "OK");
+    
+    // 返回 JSON 格式，包含開門狀態
+    if (success) {
+      server.send(200, "application/json", "{\"success\":true,\"message\":\"門已開啟\"}");
+    } else {
+      server.send(400, "application/json", "{\"success\":false,\"message\":\"開門失敗\"}");
+    }
+  });
+
+  // 檢查最後一次開門狀態 API
+  server.on("/door_status", HTTP_GET, []() {
+    diag.last_http_request = millis();
+    diag.http_request_count++;
+    
+    // 計算自最後開門以來經過的時間
+    unsigned long timeSinceLastAction = millis() - diag.last_door_action_time;
+    
+    // 如果 3 秒內開門成功，認為門仍然是開啟狀態
+    bool isDoorOpen = (diag.last_door_action_success && timeSinceLastAction < 3000);
+    
+    String json = "{";
+    json += "\"success\":" + String(diag.last_door_action_success ? "true" : "false") + ",";
+    json += "\"is_open\":" + String(isDoorOpen ? "true" : "false") + ",";
+    json += "\"time_since_action_ms\":" + String(timeSinceLastAction) + ",";
+    json += "\"reason\":\"" + diag.last_door_action_reason + "\"";
+    json += "}";
+    
+    server.send(200, "application/json", json);
   });
 
   // 主密碼變更API
@@ -1243,16 +1294,17 @@ unsigned long getNow() {
   return now;
 }
 
-// 驗證密碼（含臨時密碼）
+// 驗證密碼（含臨時密碼）- 改進版本，追蹤開門原因
 bool checkAllPasswords(String input) {
   if (input == correct_password) {
     Serial.println("主密碼正確，準備開門");
     showResult('O'); // 顯示 O 代表 Open
     delay(100); // 等待顯示穩定
     Serial.println("開始執行開鎖動作");
-    openLock();
+    diag.last_door_action_reason = "密碼";
+    bool success = openLock();
     Serial.println("開鎖動作完成");
-    return true;
+    return success;
   } 
   unsigned long now = getNow(); // 取得正確的現在時間
   for (auto it = tempPasswords.begin(); it != tempPasswords.end(); ) {
@@ -1286,9 +1338,10 @@ bool checkAllPasswords(String input) {
         showResult('O'); // 顯示 O 代表 Open
         delay(100); // 等待顯示穩定
         Serial.println("開始執行開鎖動作");
-        openLock();
+        diag.last_door_action_reason = "臨時密碼";
+        bool success = openLock();
         Serial.println("開鎖動作完成");
-        return true;
+        return success;
       } else {
         showErrorNoOnLed(7);
         return false;
@@ -1301,73 +1354,97 @@ bool checkAllPasswords(String input) {
   return false;
 }
 
-// 密碼輸入流程
+// 密碼輸入流程 - 優化版本
 void checkKeypad() {
   char key = checkKeypadInput();
   if (key) {
     if (key == '#') {
+      // 確認密碼 - 使用快速驗證，不要在此 delay
       checkAllPasswords(password_input);
       password_input = "";
+      currentDisplayText = ""; // 重置顯示狀態
     } else if (key == '*') {
       password_input = "";
+      currentDisplayText = ""; // 重置顯示狀態
       Serial.println("已清除");
-      showResult('-'); // 顯示 - 代表 已清除
+      showTextOnLed("-", 800);  // 簡短反饋，不要太長
+      clearDisplay();
     } else if (key == 'A') {
       inFingerRun = !inFingerRun;
       if (inFingerRun) { 
         Serial.println("開啟指紋偵測");
-        // 顯示指紋機啟動狀態
-        showTextOnLed("FPON    ", 1000);
+        // 顯示指紋機啟動狀態 - 降低延遲
+        showTextOnLed("FPON    ", 800);  // 降低 1000 → 800
         clearDisplay();
       } else { 
         Serial.println("關閉指紋偵測");
-        // 顯示指紋機關閉狀態
-        showTextOnLed("FPOF    ", 1000);
+        // 顯示指紋機關閉狀態 - 降低延遲
+        showTextOnLed("FPOF    ", 800);  // 降低 1000 → 800
         clearDisplay();
         // 關閉指紋機 LED（閒置時不亮）
         finger.LEDcontrol(false);
       }
     } else if (key == 'B') {
+      // 預留功能
     } else if (key == 'C') {
+      // 預留功能
     } else if (key == 'D') {
+      // 預留功能
     } else {
+      // 密碼輸入 - 非阻塞更新
       password_input += key;
-      showPasswordOnLed(password_input);
+      showPasswordOnLed(password_input);  // 不再阻塞！
     }
   }
 }
 
-// 開鎖控制（SG90 180度→3秒→0度）
-void openLock() {
+// 開鎖控制（SG90 180度→3秒→0度）- 改進版本，含狀態追蹤
+bool openLock() {
   Serial.println("=== 開鎖程序開始 ===");
   
   // 檢查冷卻時間
   unsigned long now = millis();
   if (now - lastServoAction < SERVO_COOLDOWN) {
     Serial.println("伺服馬達還在冷卻中，請稍候");
-    return;
+    diag.last_door_action_success = false;
+    diag.last_door_action_time = now;
+    return false;
   }
   lastServoAction = now;
   
-  Serial.println("1. 準備連接伺服馬達");
-  safeServoAttach();
-  
-  Serial.print("2. 開始轉動到");
-  Serial.print(servoOpenAngle);
-  Serial.println("度（開鎖）");
-  lockServo.write(servoOpenAngle); // 轉到設定角度（開鎖）
-  Serial.println("開門");
-  delay(3000); // 開鎖3秒
-  
-  Serial.println("3. 開始轉動到0度（關鎖）");
-  lockServo.write(0);   // 轉回0度（關鎖）
-  Serial.println("關門");
-  delay(1000); // 關鎖1秒
-  
-  Serial.println("4. 斷開伺服馬達連接");
-  safeServoDetach();
-  
-  Serial.println("=== 開鎖程序完成 ===");
+  try {
+    Serial.println("1. 準備連接伺服馬達");
+    safeServoAttach();
+    
+    Serial.print("2. 開始轉動到");
+    Serial.print(servoOpenAngle);
+    Serial.println("度（開鎖）");
+    lockServo.write(servoOpenAngle); // 轉到設定角度（開鎖）
+    Serial.println("開門");
+    delay(3000); // 開鎖3秒
+    
+    Serial.println("3. 開始轉動到0度（關鎖）");
+    lockServo.write(0);   // 轉回0度（關鎖）
+    Serial.println("關門");
+    delay(1000); // 關鎖1秒
+    
+    Serial.println("4. 斷開伺服馬達連接");
+    safeServoDetach();
+    
+    Serial.println("=== 開鎖程序完成 ===");
+    
+    // 標記成功
+    diag.last_door_action_success = true;
+    diag.last_door_action_time = millis();
+    return true;
+    
+  } catch (...) {
+    Serial.println("開鎖程序出錯");
+    safeServoDetach();
+    diag.last_door_action_success = false;
+    diag.last_door_action_time = millis();
+    return false;
+  }
 }
 
 // MQTT 回調函數
@@ -1387,8 +1464,13 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   // 處理開門訊號
   if (topicStr == mqtt_topic && message == "open") {
     Serial.println("收到開門訊號，執行開門動作");
-    showResult('O'); // 顯示成功
-    openLock();
+    diag.last_door_action_reason = "MQTT";
+    bool success = openLock();
+    if (success) {
+      showResult('O'); // 顯示成功
+    } else {
+      showResult('E'); // 顯示失敗
+    }
   }
   // 處理新增臨時密碼
   else if (topicStr == mqtt_topic_add_temp_pw) {
@@ -1487,4 +1569,4 @@ void reconnectMQTT() {
   }
 }
 
-// v1.1.8 - WiFi 自動重連完成
+// v1.1.9 - 優化密碼輸入延遲完成
