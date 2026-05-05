@@ -1,4 +1,4 @@
-// v1.1.9 - 修正：優化密碼輸入延遲、改進 LED 顯示非阻塞式
+// v1.2.0 - 新增：網頁 Log 同步顯示
 // ESP32 智慧門鎖主控程式
 // 功能：指紋辨識、密碼開鎖、遠端HTTP開鎖、MQTT遠端控制
 // 材料：ESP32 DEVKIT V1、AS608、4x4 Keypad、繼電器
@@ -56,6 +56,85 @@ PubSubClient client(espClient);
 
 // 使用 Preferences 替代 EEPROM
 Preferences preferences;
+
+// 日誌系統：固定大小環形緩衝區，避免長時間運行後累積過多記憶體
+static HardwareSerial &realSerial = ::Serial;
+const int LOG_BUFFER_CAPACITY = 80;
+const int LOG_MESSAGE_MAX_LEN = 120;
+String logBuffer[LOG_BUFFER_CAPACITY];
+int logHead = 0;
+int logCount = 0;
+String currentLogLine = "";
+
+void appendLogLine(const String &line) {
+  String item = line;
+  if (item.length() > LOG_MESSAGE_MAX_LEN) {
+    item = item.substring(0, LOG_MESSAGE_MAX_LEN);
+  }
+  if (logCount < LOG_BUFFER_CAPACITY) {
+    logBuffer[(logHead + logCount) % LOG_BUFFER_CAPACITY] = item;
+    logCount++;
+  } else {
+    logBuffer[logHead] = item;
+    logHead = (logHead + 1) % LOG_BUFFER_CAPACITY;
+  }
+}
+
+void appendToCurrentLog(const String &text) {
+  currentLogLine += text;
+  if (currentLogLine.length() > LOG_MESSAGE_MAX_LEN) {
+    currentLogLine = currentLogLine.substring(0, LOG_MESSAGE_MAX_LEN);
+  }
+}
+
+void pushCurrentLogLine() {
+  appendLogLine(currentLogLine);
+  currentLogLine = "";
+}
+
+String getLogsJson() {
+  String json = "[";
+  for (int i = 0; i < logCount; i++) {
+    int idx = (logHead + i) % LOG_BUFFER_CAPACITY;
+    String item = logBuffer[idx];
+    item.replace("\\", "\\\\");
+    item.replace("\"", "\\\"");
+    item.replace("\n", "\\n");
+    if (i > 0) json += ",";
+    json += "\"" + item + "\"";
+  }
+  json += "]";
+  return json;
+}
+
+class SerialProxyClass {
+public:
+  void begin(unsigned long baud) {
+    realSerial.begin(baud);
+  }
+
+  void print(const String &value) { realSerial.print(value); appendToCurrentLog(value); }
+  void print(const char *value) { realSerial.print(value); appendToCurrentLog(String(value)); }
+  void print(char value) { realSerial.print(value); appendToCurrentLog(String(value)); }
+  void print(int value) { realSerial.print(value); appendToCurrentLog(String(value)); }
+  void print(unsigned int value) { realSerial.print(value); appendToCurrentLog(String(value)); }
+  void print(long value) { realSerial.print(value); appendToCurrentLog(String(value)); }
+  void print(unsigned long value) { realSerial.print(value); appendToCurrentLog(String(value)); }
+  void print(float value, int digits = 2) { realSerial.print(value, digits); appendToCurrentLog(String(value)); }
+
+  void println(const String &value) { realSerial.println(value); appendToCurrentLog(value); pushCurrentLogLine(); }
+  void println(const char *value) { realSerial.println(value); appendToCurrentLog(String(value)); pushCurrentLogLine(); }
+  void println(char value) { realSerial.println(value); appendToCurrentLog(String(value)); pushCurrentLogLine(); }
+  void println(int value) { realSerial.println(value); appendToCurrentLog(String(value)); pushCurrentLogLine(); }
+  void println(unsigned int value) { realSerial.println(value); appendToCurrentLog(String(value)); pushCurrentLogLine(); }
+  void println(long value) { realSerial.println(value); appendToCurrentLog(String(value)); pushCurrentLogLine(); }
+  void println(unsigned long value) { realSerial.println(value); appendToCurrentLog(String(value)); pushCurrentLogLine(); }
+  void println(float value, int digits = 2) { realSerial.println(value, digits); appendToCurrentLog(String(value)); pushCurrentLogLine(); }
+  void println(void) { realSerial.println(); pushCurrentLogLine(); }
+};
+
+SerialProxyClass SerialProxy;
+#define Serial SerialProxy
 
 // 指紋模組設定 - 使用專用腳位，不共用
 #define FINGER_RX 16  // GPIO 16
@@ -321,7 +400,9 @@ void showTextOnLed(String text, int delayTime = 0) {
   
   int len = text.length();
   for (int i = 0; i < 8; i++) {
-    mx.setColumn(i, get7SegPattern(text[len-i-1])); 
+    int charIndex = len - 1 - i;
+    char c = (charIndex >= 0) ? text[charIndex] : ' ';
+    mx.setColumn(i, get7SegPattern(c));
   }
   
   lastLedUpdate = millis();
@@ -830,7 +911,7 @@ int addTempPassword(String pw, String expireStr = "", int count = -1) {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n\n=== ESP32 智慧門鎖 v1.1.9 ===");
+  Serial.println("\n\n=== ESP32 智慧門鎖 v1.2.0 ===");
   Serial.println("版本說明: 優化密碼輸入延遲、改進LED非阻塞式顯示、加入WiFi自動重連");
   
   // 初始化診斷狀態
@@ -854,7 +935,7 @@ void setup() {
   initMax7219();
   
   // 簡單測試 MAX7219 是否工作
-  showversion("v1.1.9", 1000);
+  showversion("v1.2.0", 1000);
   clearDisplay();
   
   // 增加按鍵去抖動時間，嘗試解決鬼鍵問題
@@ -1133,6 +1214,16 @@ void setup() {
     server.send(200, "text/html", html);
   });
 
+  server.on("/favicon.ico", HTTP_GET, []() {
+    server.send(204, "image/x-icon", "");
+  });
+
+  server.on("/logs", HTTP_GET, []() {
+    diag.last_http_request = millis();
+    diag.http_request_count++;
+    server.send(200, "application/json", getLogsJson());
+  });
+
   // 伺服角度 API：讀取與設定
   server.on("/get_servo_angle", HTTP_GET, []() {
     server.send(200, "application/json", String("{\"angle\":" + String(servoOpenAngle) + "}"));
@@ -1176,24 +1267,32 @@ void setup() {
     html += "<input id='did' type='number' placeholder='指紋ID'><button onclick=\"deleteFinger()\">刪除指紋</button><br><br>";
     html += "<h3>指紋清單</h3><div id='fingerlist'>載入中...</div>";
     html += "<h3>密碼清單</h3><div id='pwlist'>載入中...</div>";
-    html += "<script>\n";
-    html += "function loadAngle(){fetch('/get_servo_angle').then(r=>r.json()).then(j=>{document.getElementById('angle').value=j.angle;}).catch(e=>{console.log(e);});}\n";
-    html += "function adjAngle(n){let el=document.getElementById('angle');let v=parseInt(el.value||0);v+=n;if(v<0)v=0;if(v>180)v=180;el.value=v;}\n";
-    html += "function saveAngle(){let v=parseInt(document.getElementById('angle').value||0);if(isNaN(v))v=180;if(v<0)v=0;if(v>180)v=180;fetch('/set_servo_angle?angle='+v).then(r=>r.text()).then(t=>{alert('已儲存角度: '+v);}).catch(e=>{alert('錯誤: '+e);});}\n";
-    html += "function setPw(){let pw=document.getElementById('pw').value;if(!pw){alert('請輸入密碼');return;}fetch('/set_password?pw='+pw).then(r=>r.text()).then(t=>{alert(t);loadPwList();}).catch(e=>{alert('錯誤: '+e);});}\n";
-    html += "function addTempPw(){let pw=document.getElementById('tpw').value;if(!pw){alert('請輸入臨時密碼');return;}let expire=document.getElementById('expire').value;let count=document.getElementById('count').value;let url='/add_temp_pw?pw='+pw;if(expire)url+='&expire='+expire;if(count)url+='&count='+count;fetch(url).then(r=>r.text()).then(t=>{alert(t);loadPwList();}).catch(e=>{alert('錯誤: '+e);});}\n";
-    html += "function removeTempPw(pw){if(confirm('確定移除?'))fetch('/remove_temp_pw?pw='+pw).then(r=>r.text()).then(t=>{alert(t);loadPwList();}).catch(e=>{alert('錯誤: '+e);});}\n";
-    html += "function clearAllTempPw(){if(confirm('確定清除所有臨時密碼?'))fetch('/clear_temp_pw').then(r=>r.text()).then(t=>{alert(t);loadPwList();}).catch(e=>{alert('錯誤: '+e);});}\n";
-    html += "function enrollFinger(){let id=document.getElementById('fid').value;if(!id){alert('請輸入指紋ID');return;}fetch('/enroll?id='+id).then(r=>r.text()).then(t=>{alert(t);loadFingerList();}).catch(e=>{alert('錯誤: '+e);});}\n";
-    html += "function deleteFinger(){let id=document.getElementById('did').value;if(!id){alert('請輸入指紋ID');return;}fetch('/delete_finger?id='+id).then(r=>r.text()).then(t=>{alert(t);loadFingerList();}).catch(e=>{alert('錯誤: '+e);});}\n";
-    html += "function renameFinger(id){let name=prompt('輸入新名稱');if(!name){return;}fetch('/rename_finger?id='+id+'&name='+encodeURIComponent(name)).then(r=>r.text()).then(t=>{alert(t);loadFingerList();}).catch(e=>{alert('錯誤: '+e);});}\n";
-    html += "function loadFingerList(){fetch('/list_fingers').then(r=>r.json()).then(j=>{let html='<ul>';for(let f of j){html+='<li>#'+f.id+': '+f.name+' <button onclick=\\'renameFinger('+f.id+')\\'>改名</button> <button onclick=\\'deleteFingerId('+f.id+')\\'>刪除</button></li>';}html+='</ul>';document.getElementById('fingerlist').innerHTML=html;}).catch(e=>{document.getElementById('fingerlist').innerHTML='載入失敗: '+e;});}\n";
-    html += "function deleteFingerId(id){if(confirm('確定刪除?'))fetch('/delete_finger?id='+id).then(r=>r.text()).then(t=>{alert(t);loadFingerList();}).catch(e=>{alert('錯誤: '+e);});}\n";
-    html += "function loadPwList(){fetch('/list_passwords').then(r=>r.json()).then(j=>{let html='<b>主密碼:</b> '+j.main+'<br><b>臨時密碼:</b><ul>';for(let tp of j.temps){html+='<li>'+tp.pw+' ';if(tp.expire)html+='(到期:'+new Date(tp.expire*1000).toLocaleString()+') ';if(tp.count>=0)html+='(剩餘:'+tp.count+') ';html+='<button onclick=\"removeTempPw(\\''+tp.pw+'\\')\">移除</button></li>';}html+='</ul>';document.getElementById('pwlist').innerHTML=html;}).catch(e=>{document.getElementById('pwlist').innerHTML='載入失敗: '+e;});}\n";
-    html += "loadAngle();\n";
-    html += "loadFingerList();\n";
-    html += "loadPwList();\n";
-    html += "</script></body></html>";
+    html += "<h3>系統日誌</h3><div id='logbox' style='background:#111;color:#0f0;padding:10px;border-radius:5px;max-height:240px;overflow:auto;white-space:pre-wrap;font-family:monospace;'>載入中...</div>";
+    html += "<button onclick=\"loadLogs()\" style='margin-top:10px;'>重新整理日誌</button><br><br>";
+    html += R"rawliteral(
+<script>
+function loadAngle(){fetch('/get_servo_angle').then(r=>r.json()).then(j=>{document.getElementById('angle').value=j.angle;}).catch(e=>{console.log(e);});}
+function adjAngle(n){let el=document.getElementById('angle');let v=parseInt(el.value||0);v+=n;if(v<0)v=0;if(v>180)v=180;el.value=v;}
+function saveAngle(){let v=parseInt(document.getElementById('angle').value||0);if(isNaN(v))v=180;if(v<0)v=0;if(v>180)v=180;fetch('/set_servo_angle?angle='+v).then(r=>r.text()).then(t=>{alert('已儲存角度: '+v);}).catch(e=>{alert('錯誤: '+e);});}
+function setPw(){let pw=document.getElementById('pw').value;if(!pw){alert('請輸入密碼');return;}fetch('/set_password?pw='+encodeURIComponent(pw)).then(r=>r.text()).then(t=>{alert(t);loadPwList();}).catch(e=>{alert('錯誤: '+e);});}
+function addTempPw(){let pw=document.getElementById('tpw').value;if(!pw){alert('請輸入臨時密碼');return;}let expire=document.getElementById('expire').value;let count=document.getElementById('count').value;let url='/add_temp_pw?pw='+encodeURIComponent(pw);if(expire)url+='&expire='+encodeURIComponent(expire);if(count)url+='&count='+encodeURIComponent(count);fetch(url).then(r=>r.text()).then(t=>{alert(t);loadPwList();}).catch(e=>{alert('錯誤: '+e);});}
+function removeTempPw(pw){if(confirm('確定移除?'))fetch('/remove_temp_pw?pw='+encodeURIComponent(pw)).then(r=>r.text()).then(t=>{alert(t);loadPwList();}).catch(e=>{alert('錯誤: '+e);});}
+function clearAllTempPw(){if(confirm('確定清除所有臨時密碼?'))fetch('/clear_temp_pw').then(r=>r.text()).then(t=>{alert(t);loadPwList();}).catch(e=>{alert('錯誤: '+e);});}
+function enrollFinger(){let id=document.getElementById('fid').value;if(!id){alert('請輸入指紋ID');return;}fetch('/enroll?id='+encodeURIComponent(id)).then(r=>r.text()).then(t=>{alert(t);loadFingerList();}).catch(e=>{alert('錯誤: '+e);});}
+function deleteFinger(){let id=document.getElementById('did').value;if(!id){alert('請輸入指紋ID');return;}fetch('/delete_finger?id='+encodeURIComponent(id)).then(r=>r.text()).then(t=>{alert(t);loadFingerList();}).catch(e=>{alert('錯誤: '+e);});}
+function renameFinger(id){let name=prompt('輸入新名稱');if(!name){return;}fetch('/rename_finger?id='+encodeURIComponent(id)+'&name='+encodeURIComponent(name)).then(r=>r.text()).then(t=>{alert(t);loadFingerList();}).catch(e=>{alert('錯誤: '+e);});}
+function deleteFingerId(id){if(confirm('確定刪除?'))fetch('/delete_finger?id='+encodeURIComponent(id)).then(r=>r.text()).then(t=>{alert(t);loadFingerList();}).catch(e=>{alert('錯誤: '+e);});}
+function loadFingerList(){fetch('/list_fingers').then(r=>r.json()).then(j=>{let html='<ul>';for(let f of j){html+='<li>#'+f.id+': '+f.name+' <button onclick="renameFinger('+f.id+')">改名</button> <button onclick="deleteFingerId('+f.id+')">刪除</button></li>'; }html+='</ul>';document.getElementById('fingerlist').innerHTML=html;}).catch(e=>{document.getElementById('fingerlist').innerHTML='載入失敗: '+e;});}
+function loadPwList(){fetch('/list_passwords').then(r=>r.json()).then(j=>{let html='<b>主密碼:</b> '+j.main+'<br><b>臨時密碼:</b><ul>';for(let tp of j.temps){html+='<li>'+tp.pw+' ';if(tp.expire)html+='(到期:'+new Date(tp.expire*1000).toLocaleString()+') ';if(tp.count>=0)html+='(剩餘:'+tp.count+') ';html+='<button data-pw="'+tp.pw+'" onclick="removeTempPw(this.dataset.pw)">移除</button></li>';}html+='</ul>';document.getElementById('pwlist').innerHTML=html;}).catch(e=>{document.getElementById('pwlist').innerHTML='載入失敗: '+e;});}
+function loadLogs(){fetch('/logs').then(r=>r.json()).then(j=>{let html='';for(let line of j){html+=line+'\n';}document.getElementById('logbox').textContent=html;}).catch(e=>{document.getElementById('logbox').textContent='載入失敗: '+e;});}
+function refreshLogs(){loadLogs();}
+setInterval(loadLogs,5000);
+loadAngle();
+loadFingerList();
+loadPwList();
+loadLogs();
+</script></body></html>
+)rawliteral";
     server.send(200, "text/html", html);
   });
   
@@ -1569,4 +1668,4 @@ void reconnectMQTT() {
   }
 }
 
-// v1.1.9 - 優化密碼輸入延遲完成
+// v1.2.0 - 新增：網頁 Log 同步顯示
