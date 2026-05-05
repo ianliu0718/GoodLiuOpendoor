@@ -1,6 +1,6 @@
-// v1.1.6 - 修正：MQTT 連線問題
+// v1.2.0 - 新增：網頁 Log 同步顯示
 // ESP32 智慧門鎖主控程式
-// 功能：指紋辨識、密碼開鎖、遠端HTTP開鎖
+// 功能：指紋辨識、密碼開鎖、遠端HTTP開鎖、MQTT遠端控制
 // 材料：ESP32 DEVKIT V1、AS608、4x4 Keypad、繼電器
 
 #include <WiFi.h>
@@ -15,6 +15,23 @@
 #include <MD_MAX72xx.h> // 使用 MD_MAX72XX 庫
 #include <Preferences.h>
 #include <time.h> // 新增 NTP 校時
+
+// ===== 診斷機制 =====
+struct DiagnosticState {
+  bool wifi_connected = false;
+  bool mqtt_connected = false;
+  bool http_server_running = false;
+  unsigned long last_mqtt_attempt = 0;
+  unsigned long last_http_request = 0;
+  int mqtt_reconnect_count = 0;
+  int http_request_count = 0;
+  
+  // ===== 開門狀態追蹤 =====
+  bool last_door_action_success = false;  // 最後一次開門是否成功
+  unsigned long last_door_action_time = 0;  // 最後開門時間戳
+  String last_door_action_reason = "";    // 開門原因（HTTP/MQTT/密碼/指紋）
+};
+DiagnosticState diag;
 
 // WiFi 設定
 #define SSID_ADDR 0
@@ -39,6 +56,85 @@ PubSubClient client(espClient);
 
 // 使用 Preferences 替代 EEPROM
 Preferences preferences;
+
+// 日誌系統：固定大小環形緩衝區，避免長時間運行後累積過多記憶體
+static HardwareSerial &realSerial = ::Serial;
+const int LOG_BUFFER_CAPACITY = 80;
+const int LOG_MESSAGE_MAX_LEN = 120;
+String logBuffer[LOG_BUFFER_CAPACITY];
+int logHead = 0;
+int logCount = 0;
+String currentLogLine = "";
+
+void appendLogLine(const String &line) {
+  String item = line;
+  if (item.length() > LOG_MESSAGE_MAX_LEN) {
+    item = item.substring(0, LOG_MESSAGE_MAX_LEN);
+  }
+  if (logCount < LOG_BUFFER_CAPACITY) {
+    logBuffer[(logHead + logCount) % LOG_BUFFER_CAPACITY] = item;
+    logCount++;
+  } else {
+    logBuffer[logHead] = item;
+    logHead = (logHead + 1) % LOG_BUFFER_CAPACITY;
+  }
+}
+
+void appendToCurrentLog(const String &text) {
+  currentLogLine += text;
+  if (currentLogLine.length() > LOG_MESSAGE_MAX_LEN) {
+    currentLogLine = currentLogLine.substring(0, LOG_MESSAGE_MAX_LEN);
+  }
+}
+
+void pushCurrentLogLine() {
+  appendLogLine(currentLogLine);
+  currentLogLine = "";
+}
+
+String getLogsJson() {
+  String json = "[";
+  for (int i = 0; i < logCount; i++) {
+    int idx = (logHead + i) % LOG_BUFFER_CAPACITY;
+    String item = logBuffer[idx];
+    item.replace("\\", "\\\\");
+    item.replace("\"", "\\\"");
+    item.replace("\n", "\\n");
+    if (i > 0) json += ",";
+    json += "\"" + item + "\"";
+  }
+  json += "]";
+  return json;
+}
+
+class SerialProxyClass {
+public:
+  void begin(unsigned long baud) {
+    realSerial.begin(baud);
+  }
+
+  void print(const String &value) { realSerial.print(value); appendToCurrentLog(value); }
+  void print(const char *value) { realSerial.print(value); appendToCurrentLog(String(value)); }
+  void print(char value) { realSerial.print(value); appendToCurrentLog(String(value)); }
+  void print(int value) { realSerial.print(value); appendToCurrentLog(String(value)); }
+  void print(unsigned int value) { realSerial.print(value); appendToCurrentLog(String(value)); }
+  void print(long value) { realSerial.print(value); appendToCurrentLog(String(value)); }
+  void print(unsigned long value) { realSerial.print(value); appendToCurrentLog(String(value)); }
+  void print(float value, int digits = 2) { realSerial.print(value, digits); appendToCurrentLog(String(value)); }
+
+  void println(const String &value) { realSerial.println(value); appendToCurrentLog(value); pushCurrentLogLine(); }
+  void println(const char *value) { realSerial.println(value); appendToCurrentLog(String(value)); pushCurrentLogLine(); }
+  void println(char value) { realSerial.println(value); appendToCurrentLog(String(value)); pushCurrentLogLine(); }
+  void println(int value) { realSerial.println(value); appendToCurrentLog(String(value)); pushCurrentLogLine(); }
+  void println(unsigned int value) { realSerial.println(value); appendToCurrentLog(String(value)); pushCurrentLogLine(); }
+  void println(long value) { realSerial.println(value); appendToCurrentLog(String(value)); pushCurrentLogLine(); }
+  void println(unsigned long value) { realSerial.println(value); appendToCurrentLog(String(value)); pushCurrentLogLine(); }
+  void println(float value, int digits = 2) { realSerial.println(value, digits); appendToCurrentLog(String(value)); pushCurrentLogLine(); }
+  void println(void) { realSerial.println(); pushCurrentLogLine(); }
+};
+
+SerialProxyClass SerialProxy;
+#define Serial SerialProxy
 
 // 指紋模組設定 - 使用專用腳位，不共用
 #define FINGER_RX 16  // GPIO 16
@@ -71,7 +167,7 @@ String correct_password = ""; // 主要預設密碼
 String password_input = "";       //  程式修改後儲存密碼
 String currentDisplayText = "";   //  程式比對用的密碼
 unsigned long lastKeypadCheck = 0;
-const unsigned long KEYPAD_CHECK_INTERVAL = 120; // 每120ms掃描一次
+const unsigned long KEYPAD_CHECK_INTERVAL = 50; // 優化：減少至 50ms，提高反應性（原本 120ms）
 
 // SG90控制腳位
 #define SERVO_PIN 5  // ESP32 腳位
@@ -288,20 +384,35 @@ void initMax7219() {
   Serial.println("MAX7219 初始化完成");
 }
 
-// 顯示
-void showTextOnLed(String text, int delayTime = 700) {
+// ====== 優化：非阻塞式 LED 顯示 ======
+unsigned long lastLedUpdate = 0;
+const unsigned long LED_UPDATE_INTERVAL = 100;  // 100ms 更新一次，避免頻繁重繪
+unsigned long lastDisplayChangeTime = 0;
+const unsigned long DISPLAY_HOLD_TIME = 500;   // 顯示保持 500ms（不阻塞）
+bool isShowingTemporaryDisplay = false;
+
+void showTextOnLed(String text, int delayTime = 0) {
+  // delayTime = 0 時為非阻塞模式（用於密碼輸入）
+  // delayTime > 0 時為傳統模式（用於啟動、錯誤等）
+  
   Serial.println("showTextOnLed: " + text);
   mx.clear();
   
   int len = text.length();
   for (int i = 0; i < 8; i++) {
-    mx.setColumn(i, get7SegPattern(text[len-i-1])); 
+    int charIndex = len - 1 - i;
+    char c = (charIndex >= 0) ? text[charIndex] : ' ';
+    mx.setColumn(i, get7SegPattern(c));
   }
   
-  delay(delayTime);
+  lastLedUpdate = millis();
+  
+  // 只在需要阻塞時才 delay（啟動、結果顯示等）
+  if (delayTime > 0) {
+    delay(delayTime);
+  }
 }
 
-// 顯示板號（支援小數點）
 void showversion(String text, int delayTime = 700) {
   Serial.println("showVersion: " + text);
   mx.clear();
@@ -340,18 +451,21 @@ void showversion(String text, int delayTime = 700) {
   delay(delayTime);
 }
 
-// 顯示密碼在 MAX7219（右對齊，最多8碼）
+// 顯示密碼在 MAX7219（右對齊，最多8碼）- 優化版本
 void showPasswordOnLed(String pw) {
   Serial.println("密碼輸入: " + pw);
   if (pw == currentDisplayText) return; // 避免重複刷新
   currentDisplayText = pw;
-  showTextOnLed(pw);
+  // 非阻塞式更新：不使用 delay
+  showTextOnLed(pw, 0);  // ← 傳 0 表示非阻塞
+  lastDisplayChangeTime = millis();
+  isShowingTemporaryDisplay = true;
 }
 
 // 顯示錯誤編號在 MAX7219（右對齊，最多4碼）
 void showErrorNoOnLed(int no) {
   Serial.println("錯誤編號: " + String(no));
-  showTextOnLed(" Err" + String(no), 2000);
+  showTextOnLed(" Err" + String(no), 1500);  // 降低 delay 時間 2000 → 1500
   clearDisplay();
 }
 
@@ -359,9 +473,9 @@ void showErrorNoOnLed(int no) {
 void showResult(char result) {
   Serial.println("結果: " + String(result));
   if (result == 'E') {
-    showTextOnLed("Error", 2000);
+    showTextOnLed("Error", 1500);  // 降低 delay 時間 2000 → 1500
   } else {
-    showTextOnLed(String(result), 2000);
+    showTextOnLed(String(result), 1200);  // 降低 delay 時間 2000 → 1200
   }
   clearDisplay();
 }
@@ -567,6 +681,7 @@ void connectToWiFi() {
     Serial.println("\nWiFi 連線成功");
     Serial.print("IP: ");
     Serial.println(WiFi.localIP());
+    diag.wifi_connected = true;
     IPAddress ip = WiFi.localIP();
     String ipArr[4];
     ipArr[0] = String(ip[0]);
@@ -583,11 +698,13 @@ void connectToWiFi() {
     showTextOnLed(group1 + group2, 3000);
   } else {
     Serial.println("\nWiFi 連線失敗，啟動AP模式");
+    diag.wifi_connected = false;
     inSetupMode = true;
     WiFi.softAP("Lock_Setup_AP", "password");
     server.on("/", HTTP_GET, handleRoot);
     server.on("/save", HTTP_POST, handleSave);
     server.begin();
+    diag.http_server_running = true;
     showTextOnLed("AP     ", 3000);
     IPAddress apIP = WiFi.softAPIP();
     Serial.print("AP模式啟動，請連接WiFi並設定，AP IP: ");
@@ -794,7 +911,17 @@ int addTempPassword(String pw, String expireStr = "", int count = -1) {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("ESP32 智慧門鎖 v1.1.6");
+  Serial.println("\n\n=== ESP32 智慧門鎖 v1.2.0 ===");
+  Serial.println("版本說明: 優化密碼輸入延遲、改進LED非阻塞式顯示、加入WiFi自動重連");
+  
+  // 初始化診斷狀態
+  diag.wifi_connected = false;
+  diag.mqtt_connected = false;
+  diag.http_server_running = false;
+  diag.last_mqtt_attempt = 0;
+  diag.last_http_request = 0;
+  diag.mqtt_reconnect_count = 0;
+  diag.http_request_count = 0;
   
   Serial.println("初始化伺服馬達...");
   safeServoAttach();
@@ -808,7 +935,7 @@ void setup() {
   initMax7219();
   
   // 簡單測試 MAX7219 是否工作
-  showversion("v1.1.6", 1000);
+  showversion("v1.2.0", 1000);
   clearDisplay();
   
   // 增加按鍵去抖動時間，嘗試解決鬼鍵問題
@@ -832,6 +959,7 @@ void setup() {
     server.on("/", HTTP_GET, handleRoot);
     server.on("/save", HTTP_POST, handleSave);
     server.begin();
+    diag.http_server_running = true;
     showTextOnLed("AP     ", 3000);
     IPAddress apIP = WiFi.softAPIP();
     Serial.print("AP模式啟動，請連接WiFi並設定，AP IP: ");
@@ -867,9 +995,39 @@ void setup() {
 
   // HTTP 遠端開門
   server.on("/open", HTTP_GET, []() {
-    openLock();
+    diag.last_http_request = millis();
+    diag.http_request_count++;
+    diag.last_door_action_reason = "HTTP";
+    bool success = openLock();
     clearDisplay();
-    server.send(200, "text/plain", "OK");
+    
+    // 返回 JSON 格式，包含開門狀態
+    if (success) {
+      server.send(200, "application/json", "{\"success\":true,\"message\":\"門已開啟\"}");
+    } else {
+      server.send(400, "application/json", "{\"success\":false,\"message\":\"開門失敗\"}");
+    }
+  });
+
+  // 檢查最後一次開門狀態 API
+  server.on("/door_status", HTTP_GET, []() {
+    diag.last_http_request = millis();
+    diag.http_request_count++;
+    
+    // 計算自最後開門以來經過的時間
+    unsigned long timeSinceLastAction = millis() - diag.last_door_action_time;
+    
+    // 如果 3 秒內開門成功，認為門仍然是開啟狀態
+    bool isDoorOpen = (diag.last_door_action_success && timeSinceLastAction < 3000);
+    
+    String json = "{";
+    json += "\"success\":" + String(diag.last_door_action_success ? "true" : "false") + ",";
+    json += "\"is_open\":" + String(isDoorOpen ? "true" : "false") + ",";
+    json += "\"time_since_action_ms\":" + String(timeSinceLastAction) + ",";
+    json += "\"reason\":\"" + diag.last_door_action_reason + "\"";
+    json += "}";
+    
+    server.send(200, "application/json", json);
   });
 
   // 主密碼變更API
@@ -1006,6 +1164,66 @@ void setup() {
     server.send(200, "text/plain", "OK");
   });
 
+  // ===== 診斷 API ===== 
+  server.on("/status", HTTP_GET, []() {
+    diag.last_http_request = millis();
+    String json = "{";
+    json += "\"wifi\":" + String(diag.wifi_connected ? "true" : "false") + ",";
+    json += "\"mqtt\":" + String(diag.mqtt_connected ? "true" : "false") + ",";
+    json += "\"http_server\":" + String(diag.http_server_running ? "true" : "false") + ",";
+    json += "\"http_requests\":" + String(diag.http_request_count) + ",";
+    json += "\"mqtt_reconnects\":" + String(diag.mqtt_reconnect_count) + ",";
+    json += "\"uptime_ms\":" + String(millis()) + ",";
+    json += "\"last_http_ms\":" + String(diag.last_http_request);
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/debug", HTTP_GET, []() {
+    diag.last_http_request = millis();
+    String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>除錯診斷</title><meta http-equiv='refresh' content='5'></head><body>";
+    html += "<h2>🔧 系統除錯診斷頁面</h2>";
+    html += "<p>此頁面每5秒自動刷新。</p>";
+    html += "<table border='1' cellpadding='10'>";
+    
+    html += "<tr><td><b>WiFi 狀態</b></td><td>" + String(diag.wifi_connected ? "✅ 已連接" : "❌ 未連接") + "</td></tr>";
+    if (diag.wifi_connected) {
+      html += "<tr><td><b>本機 IP</b></td><td>" + WiFi.localIP().toString() + "</td></tr>";
+      html += "<tr><td><b>信號強度</b></td><td>" + String(WiFi.RSSI()) + " dBm</td></tr>";
+    }
+    
+    html += "<tr><td><b>MQTT 狀態</b></td><td>" + String(diag.mqtt_connected ? "✅ 已連接" : "❌ 已斷開") + "</td></tr>";
+    html += "<tr><td><b>MQTT 重連計數</b></td><td>" + String(diag.mqtt_reconnect_count) + "</td></tr>";
+    
+    html += "<tr><td><b>HTTP Server</b></td><td>" + String(diag.http_server_running ? "✅ 運行" : "❌ 停止") + "</td></tr>";
+    html += "<tr><td><b>HTTP 請求計數</b></td><td>" + String(diag.http_request_count) + "</td></tr>";
+    
+    unsigned long uptime = millis() / 1000;
+    unsigned long days = uptime / 86400;
+    unsigned long hours = (uptime % 86400) / 3600;
+    unsigned long minutes = (uptime % 3600) / 60;
+    unsigned long seconds = uptime % 60;
+    html += "<tr><td><b>運行時間</b></td><td>" + String(days) + "d " + String(hours) + "h " + String(minutes) + "m " + String(seconds) + "s</td></tr>";
+    
+    html += "<tr><td><b>自由 RAM</b></td><td>" + String(ESP.getFreeHeap()) + " bytes</td></tr>";
+    html += "<tr><td><b>指紋模組</b></td><td>" + String(fingerAvailable ? "✅ 就位" : "❌ 未連接") + "</td></tr>";
+    
+    html += "</table>";
+    html += "<br><button onclick=\"location.reload()\">手動重整</button>";
+    html += "</body></html>";
+    server.send(200, "text/html", html);
+  });
+
+  server.on("/favicon.ico", HTTP_GET, []() {
+    server.send(204, "image/x-icon", "");
+  });
+
+  server.on("/logs", HTTP_GET, []() {
+    diag.last_http_request = millis();
+    diag.http_request_count++;
+    server.send(200, "application/json", getLogsJson());
+  });
+
   // 伺服角度 API：讀取與設定
   server.on("/get_servo_angle", HTTP_GET, []() {
     server.send(200, "application/json", String("{\"angle\":" + String(servoOpenAngle) + "}"));
@@ -1021,8 +1239,18 @@ void setup() {
   });
   
   server.on("/", HTTP_GET, []() {
+    diag.last_http_request = millis();
+    diag.http_request_count++;
     String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>智慧門鎖控制</title></head><body>";
     html += "<h2>智慧門鎖控制面板</h2>";
+    html += "<div style='background-color:#eee; padding:10px; margin:10px 0; border-radius:5px;'>";
+    html += "<h3>📊 系統診斷</h3>";
+    html += "<p><b>WiFi 狀態:</b> " + String(diag.wifi_connected ? "✅ 已連接" : "❌ 未連接") + "</p>";
+    html += "<p><b>MQTT 狀態:</b> " + String(diag.mqtt_connected ? "✅ 已連接" : "❌ 未連接") + "</p>";
+    html += "<p><b>HTTP Server:</b> " + String(diag.http_server_running ? "✅ 運行中" : "❌ 已停止") + "</p>";
+    html += "<p><b>HTTP 請求數:</b> " + String(diag.http_request_count) + "</p>";
+    html += "<p><b>MQTT 重連次數:</b> " + String(diag.mqtt_reconnect_count) + "</p>";
+    html += "</div>";
     html += "<button onclick=\"fetch('/open').then(r=>alert('已開鎖'))\">開鎖</button><br><br>";
     html += "<h3>開門角度</h3>";
     html += "<button onclick=\"adjAngle(-1)\">-1</button> ";
@@ -1039,37 +1267,46 @@ void setup() {
     html += "<input id='did' type='number' placeholder='指紋ID'><button onclick=\"deleteFinger()\">刪除指紋</button><br><br>";
     html += "<h3>指紋清單</h3><div id='fingerlist'>載入中...</div>";
     html += "<h3>密碼清單</h3><div id='pwlist'>載入中...</div>";
-    html += "<script>\n";
-    html += "function loadAngle(){fetch('/get_servo_angle').then(r=>r.json()).then(j=>{document.getElementById('angle').value=j.angle;}).catch(e=>{console.log(e);});}\n";
-    html += "function adjAngle(n){let el=document.getElementById('angle');let v=parseInt(el.value||0);v+=n;if(v<0)v=0;if(v>180)v=180;el.value=v;}\n";
-    html += "function saveAngle(){let v=parseInt(document.getElementById('angle').value||0);if(isNaN(v))v=180;if(v<0)v=0;if(v>180)v=180;fetch('/set_servo_angle?angle='+v).then(r=>r.text()).then(t=>{alert('已儲存角度: '+v);}).catch(e=>{alert('錯誤: '+e);});}\n";
-    html += "function setPw(){let pw=document.getElementById('pw').value;if(!pw){alert('請輸入密碼');return;}fetch('/set_password?pw='+pw).then(r=>r.text()).then(t=>{alert(t);loadPwList();}).catch(e=>{alert('錯誤: '+e);});}\n";
-    html += "function addTempPw(){let pw=document.getElementById('tpw').value;if(!pw){alert('請輸入臨時密碼');return;}let expire=document.getElementById('expire').value;let count=document.getElementById('count').value;let url='/add_temp_pw?pw='+pw;if(expire)url+='&expire='+expire;if(count)url+='&count='+count;fetch(url).then(r=>r.text()).then(t=>{alert(t);loadPwList();}).catch(e=>{alert('錯誤: '+e);});}\n";
-    html += "function removeTempPw(pw){if(confirm('確定移除?'))fetch('/remove_temp_pw?pw='+pw).then(r=>r.text()).then(t=>{alert(t);loadPwList();}).catch(e=>{alert('錯誤: '+e);});}\n";
-    html += "function clearAllTempPw(){if(confirm('確定清除所有臨時密碼?'))fetch('/clear_temp_pw').then(r=>r.text()).then(t=>{alert(t);loadPwList();}).catch(e=>{alert('錯誤: '+e);});}\n";
-    html += "function enrollFinger(){let id=document.getElementById('fid').value;if(!id){alert('請輸入指紋ID');return;}fetch('/enroll?id='+id).then(r=>r.text()).then(t=>{alert(t);loadFingerList();}).catch(e=>{alert('錯誤: '+e);});}\n";
-    html += "function deleteFinger(){let id=document.getElementById('did').value;if(!id){alert('請輸入指紋ID');return;}fetch('/delete_finger?id='+id).then(r=>r.text()).then(t=>{alert(t);loadFingerList();}).catch(e=>{alert('錯誤: '+e);});}\n";
-    html += "function renameFinger(id){let name=prompt('輸入新名稱');if(!name){return;}fetch('/rename_finger?id='+id+'&name='+encodeURIComponent(name)).then(r=>r.text()).then(t=>{alert(t);loadFingerList();}).catch(e=>{alert('錯誤: '+e);});}\n";
-    html += "function loadFingerList(){fetch('/list_fingers').then(r=>r.json()).then(j=>{let html='<ul>';for(let f of j){html+='<li>#'+f.id+': '+f.name+' <button onclick=\\'renameFinger('+f.id+')\\'>改名</button> <button onclick=\\'deleteFingerId('+f.id+')\\'>刪除</button></li>';}html+='</ul>';document.getElementById('fingerlist').innerHTML=html;}).catch(e=>{document.getElementById('fingerlist').innerHTML='載入失敗: '+e;});}\n";
-    html += "function deleteFingerId(id){if(confirm('確定刪除?'))fetch('/delete_finger?id='+id).then(r=>r.text()).then(t=>{alert(t);loadFingerList();}).catch(e=>{alert('錯誤: '+e);});}\n";
-    html += "function loadPwList(){fetch('/list_passwords').then(r=>r.json()).then(j=>{let html='<b>主密碼:</b> '+j.main+'<br><b>臨時密碼:</b><ul>';for(let tp of j.temps){html+='<li>'+tp.pw+' ';if(tp.expire)html+='(到期:'+new Date(tp.expire*1000).toLocaleString()+') ';if(tp.count>=0)html+='(剩餘:'+tp.count+') ';html+='<button onclick=\"removeTempPw(\\''+tp.pw+'\\')\">移除</button></li>';}html+='</ul>';document.getElementById('pwlist').innerHTML=html;}).catch(e=>{document.getElementById('pwlist').innerHTML='載入失敗: '+e;});}\n";
-    html += "loadAngle();\n";
-    html += "loadFingerList();\n";
-    html += "loadPwList();\n";
-    html += "</script></body></html>";
+    html += "<h3>系統日誌</h3><div id='logbox' style='background:#111;color:#0f0;padding:10px;border-radius:5px;max-height:240px;overflow:auto;white-space:pre-wrap;font-family:monospace;'>載入中...</div>";
+    html += "<button onclick=\"loadLogs()\" style='margin-top:10px;'>重新整理日誌</button><br><br>";
+    html += R"rawliteral(
+<script>
+function loadAngle(){fetch('/get_servo_angle').then(r=>r.json()).then(j=>{document.getElementById('angle').value=j.angle;}).catch(e=>{console.log(e);});}
+function adjAngle(n){let el=document.getElementById('angle');let v=parseInt(el.value||0);v+=n;if(v<0)v=0;if(v>180)v=180;el.value=v;}
+function saveAngle(){let v=parseInt(document.getElementById('angle').value||0);if(isNaN(v))v=180;if(v<0)v=0;if(v>180)v=180;fetch('/set_servo_angle?angle='+v).then(r=>r.text()).then(t=>{alert('已儲存角度: '+v);}).catch(e=>{alert('錯誤: '+e);});}
+function setPw(){let pw=document.getElementById('pw').value;if(!pw){alert('請輸入密碼');return;}fetch('/set_password?pw='+encodeURIComponent(pw)).then(r=>r.text()).then(t=>{alert(t);loadPwList();}).catch(e=>{alert('錯誤: '+e);});}
+function addTempPw(){let pw=document.getElementById('tpw').value;if(!pw){alert('請輸入臨時密碼');return;}let expire=document.getElementById('expire').value;let count=document.getElementById('count').value;let url='/add_temp_pw?pw='+encodeURIComponent(pw);if(expire)url+='&expire='+encodeURIComponent(expire);if(count)url+='&count='+encodeURIComponent(count);fetch(url).then(r=>r.text()).then(t=>{alert(t);loadPwList();}).catch(e=>{alert('錯誤: '+e);});}
+function removeTempPw(pw){if(confirm('確定移除?'))fetch('/remove_temp_pw?pw='+encodeURIComponent(pw)).then(r=>r.text()).then(t=>{alert(t);loadPwList();}).catch(e=>{alert('錯誤: '+e);});}
+function clearAllTempPw(){if(confirm('確定清除所有臨時密碼?'))fetch('/clear_temp_pw').then(r=>r.text()).then(t=>{alert(t);loadPwList();}).catch(e=>{alert('錯誤: '+e);});}
+function enrollFinger(){let id=document.getElementById('fid').value;if(!id){alert('請輸入指紋ID');return;}fetch('/enroll?id='+encodeURIComponent(id)).then(r=>r.text()).then(t=>{alert(t);loadFingerList();}).catch(e=>{alert('錯誤: '+e);});}
+function deleteFinger(){let id=document.getElementById('did').value;if(!id){alert('請輸入指紋ID');return;}fetch('/delete_finger?id='+encodeURIComponent(id)).then(r=>r.text()).then(t=>{alert(t);loadFingerList();}).catch(e=>{alert('錯誤: '+e);});}
+function renameFinger(id){let name=prompt('輸入新名稱');if(!name){return;}fetch('/rename_finger?id='+encodeURIComponent(id)+'&name='+encodeURIComponent(name)).then(r=>r.text()).then(t=>{alert(t);loadFingerList();}).catch(e=>{alert('錯誤: '+e);});}
+function deleteFingerId(id){if(confirm('確定刪除?'))fetch('/delete_finger?id='+encodeURIComponent(id)).then(r=>r.text()).then(t=>{alert(t);loadFingerList();}).catch(e=>{alert('錯誤: '+e);});}
+function loadFingerList(){fetch('/list_fingers').then(r=>r.json()).then(j=>{let html='<ul>';for(let f of j){html+='<li>#'+f.id+': '+f.name+' <button onclick="renameFinger('+f.id+')">改名</button> <button onclick="deleteFingerId('+f.id+')">刪除</button></li>'; }html+='</ul>';document.getElementById('fingerlist').innerHTML=html;}).catch(e=>{document.getElementById('fingerlist').innerHTML='載入失敗: '+e;});}
+function loadPwList(){fetch('/list_passwords').then(r=>r.json()).then(j=>{let html='<b>主密碼:</b> '+j.main+'<br><b>臨時密碼:</b><ul>';for(let tp of j.temps){html+='<li>'+tp.pw+' ';if(tp.expire)html+='(到期:'+new Date(tp.expire*1000).toLocaleString()+') ';if(tp.count>=0)html+='(剩餘:'+tp.count+') ';html+='<button data-pw="'+tp.pw+'" onclick="removeTempPw(this.dataset.pw)">移除</button></li>';}html+='</ul>';document.getElementById('pwlist').innerHTML=html;}).catch(e=>{document.getElementById('pwlist').innerHTML='載入失敗: '+e;});}
+function loadLogs(){fetch('/logs').then(r=>r.json()).then(j=>{let html='';for(let line of j){html+=line+'\n';}document.getElementById('logbox').textContent=html;}).catch(e=>{document.getElementById('logbox').textContent='載入失敗: '+e;});}
+function refreshLogs(){loadLogs();}
+setInterval(loadLogs,5000);
+loadAngle();
+loadFingerList();
+loadPwList();
+loadLogs();
+</script></body></html>
+)rawliteral";
     server.send(200, "text/html", html);
   });
   
   server.begin();
+  diag.http_server_running = true;
 
   // 初始化 MQTT（僅在 WiFi 連接成功時）
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("WiFi 已連接，初始化 MQTT...");
+    Serial.println("[SETUP] WiFi 已連接，初始化 MQTT...");
     client.setServer(mqtt_server, mqtt_port);
     client.setCallback(mqttCallback);
     reconnectMQTT();
   } else {
-    Serial.println("WiFi 未連接，跳過 MQTT 初始化");
+    Serial.println("[SETUP] WiFi 未連接，跳過 MQTT 初始化，將於 loop 中自動重試");
   }
 
   //顯示oooo代表完成，可輸入密碼。
@@ -1079,16 +1316,57 @@ void setup() {
   loadTempPasswordsFromPreferences(); // ← 開機時載入臨時密碼
 }
 
+// WiFi 重連相關變數
+unsigned long lastWiFiReconnectAttempt = 0;
+const unsigned long WIFI_RECONNECT_INTERVAL = 10000; // WiFi 每10秒嘗試一次重連
+
 void loop() {
-  server.handleClient();
+  // === 持續處理 HTTP 請求（必須頻繁調用避免阻塞） ===
+  if (diag.http_server_running) {
+    server.handleClient(); // 每個 loop 都要處理，避免客戶端超時
+  }
   
-  // 僅在 WiFi 連接成功且不在設置模式時處理 MQTT
-  if (!inSetupMode && WiFi.status() == WL_CONNECTED) {
-    if (!client.connected()) {
-      showErrorNoOnLed(16);
+  // === WiFi 狀態監測與自動重連 ===
+  bool currentWiFiStatus = (WiFi.status() == WL_CONNECTED);
+  
+  if (!inSetupMode) {
+    if (!currentWiFiStatus) {
+      // WiFi 已斷線，嘗試重連（每10秒最多一次）
+      if (millis() - lastWiFiReconnectAttempt > WIFI_RECONNECT_INTERVAL) {
+        Serial.println("[WiFi] ⚠️ WiFi 已斷開，嘗試重新連接...");
+        WiFi.reconnect();  // ESP32 WiFi 函式，自動使用已保存的 SSID/Password
+        lastWiFiReconnectAttempt = millis();
+      }
+    } else if (!diag.wifi_connected) {
+      // WiFi 剛連上（從斷線狀態恢復）
+      Serial.println("[WiFi] ✅ WiFi 已重新連接");
+      // 立即嘗試重連 MQTT
+      if (!client.connected()) {
+        Serial.println("[WiFi] 觸發 MQTT 重連");
+        diag.last_mqtt_attempt = 0;  // 重置 MQTT 重連計時器，立即嘗試
+      }
+    }
+  }
+  
+  diag.wifi_connected = currentWiFiStatus;
+  
+  // === MQTT 連線管理（改進版，避免無限重試） ===
+  if (!inSetupMode && diag.wifi_connected) {
+    // 定期檢查 MQTT 連線，如果斷開則嘗試重連（每5秒最多一次）
+    if (!client.connected() && (millis() - diag.last_mqtt_attempt > 5000)) {
+      Serial.println("[MQTT] 連線已斷開，嘗試重連...");
+      diag.mqtt_reconnect_count++;
+      diag.last_mqtt_attempt = millis();
       reconnectMQTT();
     }
-    client.loop();
+    
+    // 只在連接時才調用 loop，避免非連接狀態下的堆積
+    if (client.connected()) {
+      diag.mqtt_connected = true;
+      client.loop();
+    } else {
+      diag.mqtt_connected = false;
+    }
   }
   
   if (inSetupMode) return;
@@ -1115,16 +1393,17 @@ unsigned long getNow() {
   return now;
 }
 
-// 驗證密碼（含臨時密碼）
+// 驗證密碼（含臨時密碼）- 改進版本，追蹤開門原因
 bool checkAllPasswords(String input) {
   if (input == correct_password) {
     Serial.println("主密碼正確，準備開門");
     showResult('O'); // 顯示 O 代表 Open
     delay(100); // 等待顯示穩定
     Serial.println("開始執行開鎖動作");
-    openLock();
+    diag.last_door_action_reason = "密碼";
+    bool success = openLock();
     Serial.println("開鎖動作完成");
-    return true;
+    return success;
   } 
   unsigned long now = getNow(); // 取得正確的現在時間
   for (auto it = tempPasswords.begin(); it != tempPasswords.end(); ) {
@@ -1158,9 +1437,10 @@ bool checkAllPasswords(String input) {
         showResult('O'); // 顯示 O 代表 Open
         delay(100); // 等待顯示穩定
         Serial.println("開始執行開鎖動作");
-        openLock();
+        diag.last_door_action_reason = "臨時密碼";
+        bool success = openLock();
         Serial.println("開鎖動作完成");
-        return true;
+        return success;
       } else {
         showErrorNoOnLed(7);
         return false;
@@ -1173,73 +1453,97 @@ bool checkAllPasswords(String input) {
   return false;
 }
 
-// 密碼輸入流程
+// 密碼輸入流程 - 優化版本
 void checkKeypad() {
   char key = checkKeypadInput();
   if (key) {
     if (key == '#') {
+      // 確認密碼 - 使用快速驗證，不要在此 delay
       checkAllPasswords(password_input);
       password_input = "";
+      currentDisplayText = ""; // 重置顯示狀態
     } else if (key == '*') {
       password_input = "";
+      currentDisplayText = ""; // 重置顯示狀態
       Serial.println("已清除");
-      showResult('-'); // 顯示 - 代表 已清除
+      showTextOnLed("-", 800);  // 簡短反饋，不要太長
+      clearDisplay();
     } else if (key == 'A') {
       inFingerRun = !inFingerRun;
       if (inFingerRun) { 
         Serial.println("開啟指紋偵測");
-        // 顯示指紋機啟動狀態
-        showTextOnLed("FPON    ", 1000);
+        // 顯示指紋機啟動狀態 - 降低延遲
+        showTextOnLed("FPON    ", 800);  // 降低 1000 → 800
         clearDisplay();
       } else { 
         Serial.println("關閉指紋偵測");
-        // 顯示指紋機關閉狀態
-        showTextOnLed("FPOF    ", 1000);
+        // 顯示指紋機關閉狀態 - 降低延遲
+        showTextOnLed("FPOF    ", 800);  // 降低 1000 → 800
         clearDisplay();
         // 關閉指紋機 LED（閒置時不亮）
         finger.LEDcontrol(false);
       }
     } else if (key == 'B') {
+      // 預留功能
     } else if (key == 'C') {
+      // 預留功能
     } else if (key == 'D') {
+      // 預留功能
     } else {
+      // 密碼輸入 - 非阻塞更新
       password_input += key;
-      showPasswordOnLed(password_input);
+      showPasswordOnLed(password_input);  // 不再阻塞！
     }
   }
 }
 
-// 開鎖控制（SG90 180度→3秒→0度）
-void openLock() {
+// 開鎖控制（SG90 180度→3秒→0度）- 改進版本，含狀態追蹤
+bool openLock() {
   Serial.println("=== 開鎖程序開始 ===");
   
   // 檢查冷卻時間
   unsigned long now = millis();
   if (now - lastServoAction < SERVO_COOLDOWN) {
     Serial.println("伺服馬達還在冷卻中，請稍候");
-    return;
+    diag.last_door_action_success = false;
+    diag.last_door_action_time = now;
+    return false;
   }
   lastServoAction = now;
   
-  Serial.println("1. 準備連接伺服馬達");
-  safeServoAttach();
-  
-  Serial.print("2. 開始轉動到");
-  Serial.print(servoOpenAngle);
-  Serial.println("度（開鎖）");
-  lockServo.write(servoOpenAngle); // 轉到設定角度（開鎖）
-  Serial.println("開門");
-  delay(3000); // 開鎖3秒
-  
-  Serial.println("3. 開始轉動到0度（關鎖）");
-  lockServo.write(0);   // 轉回0度（關鎖）
-  Serial.println("關門");
-  delay(1000); // 關鎖1秒
-  
-  Serial.println("4. 斷開伺服馬達連接");
-  safeServoDetach();
-  
-  Serial.println("=== 開鎖程序完成 ===");
+  try {
+    Serial.println("1. 準備連接伺服馬達");
+    safeServoAttach();
+    
+    Serial.print("2. 開始轉動到");
+    Serial.print(servoOpenAngle);
+    Serial.println("度（開鎖）");
+    lockServo.write(servoOpenAngle); // 轉到設定角度（開鎖）
+    Serial.println("開門");
+    delay(3000); // 開鎖3秒
+    
+    Serial.println("3. 開始轉動到0度（關鎖）");
+    lockServo.write(0);   // 轉回0度（關鎖）
+    Serial.println("關門");
+    delay(1000); // 關鎖1秒
+    
+    Serial.println("4. 斷開伺服馬達連接");
+    safeServoDetach();
+    
+    Serial.println("=== 開鎖程序完成 ===");
+    
+    // 標記成功
+    diag.last_door_action_success = true;
+    diag.last_door_action_time = millis();
+    return true;
+    
+  } catch (...) {
+    Serial.println("開鎖程序出錯");
+    safeServoDetach();
+    diag.last_door_action_success = false;
+    diag.last_door_action_time = millis();
+    return false;
+  }
 }
 
 // MQTT 回調函數
@@ -1259,8 +1563,13 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   // 處理開門訊號
   if (topicStr == mqtt_topic && message == "open") {
     Serial.println("收到開門訊號，執行開門動作");
-    showResult('O'); // 顯示成功
-    openLock();
+    diag.last_door_action_reason = "MQTT";
+    bool success = openLock();
+    if (success) {
+      showResult('O'); // 顯示成功
+    } else {
+      showResult('E'); // 顯示失敗
+    }
   }
   // 處理新增臨時密碼
   else if (topicStr == mqtt_topic_add_temp_pw) {
@@ -1304,31 +1613,59 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
 }
 
-// MQTT 重連函數
+// MQTT 重連函數 - 改進版，設定重連次數上限避免無限重試
 void reconnectMQTT() {
   // 檢查 WiFi 連接狀態
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi 未連接，無法連接 MQTT");
+    Serial.println("[MQTT] WiFi 未連接，無法連接 MQTT");
+    diag.mqtt_connected = false;
     return;
   }
   
-  while (!client.connected()) {
-    Serial.print("Attempting MQTT connection...");
-    if (client.connect("ESP32Client", mqtt_user, mqtt_pass)) {
-      Serial.println("connected");
-      Serial.print("訂閱 topic: ");
+  // 防止無限重連：每次嘗試最多2次，間隔5秒
+  int attemptCount = 0;
+  const int MAX_ATTEMPTS = 2;
+  
+  while (!client.connected() && attemptCount < MAX_ATTEMPTS) {
+    attemptCount++;
+    Serial.print("[MQTT] 嘗試連接 (");
+    Serial.print(attemptCount);
+    Serial.print("/");
+    Serial.print(MAX_ATTEMPTS);
+    Serial.print(") 至 ");
+    Serial.print(mqtt_server);
+    Serial.print(":");
+    Serial.println(mqtt_port);
+    
+    if (client.connect("ESP32_Door", mqtt_user, mqtt_pass)) {
+      Serial.println("[MQTT] ✅ 連接成功");
+      diag.mqtt_connected = true;
+      
+      // 訂閱主題
+      Serial.print("[MQTT] 訂閱 topic: ");
       Serial.println(mqtt_topic);
       client.subscribe(mqtt_topic);
-      Serial.print("訂閱 topic: ");
+      
+      Serial.print("[MQTT] 訂閱 topic: ");
       Serial.println(mqtt_topic_add_temp_pw);
       client.subscribe(mqtt_topic_add_temp_pw);
+      
+      return;
     } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
-      delay(5000);
+      Serial.print("[MQTT] ❌ 連接失敗，狀態碼: ");
+      Serial.println(client.state());
+      diag.mqtt_connected = false;
+      
+      if (attemptCount < MAX_ATTEMPTS) {
+        Serial.println("[MQTT] 5秒後重試...");
+        delay(5000);
+      }
     }
+  }
+  
+  if (!client.connected()) {
+    Serial.println("[MQTT] ⚠️ 已達重試上限，將於下次 loop 重新嘗試");
   }
 }
 
-// v1.1.6
+// v1.2.0 - 新增：網頁 Log 同步顯示

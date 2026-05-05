@@ -80,7 +80,12 @@
     </div>
     <div id="control" style="display: none;">
         <h2>歡迎！</h2>
-        <button onclick="openDoor()">開門</button>
+        <button onclick="openDoor()" id="openDoorBtn">開門</button>
+        <div id="doorStatus" style="margin-top: 10px; min-height: 30px; display: none;">
+            <div style="display: inline-block; padding: 8px 16px; border-radius: 4px; background: #f0f0f0;">
+                <span id="doorStatusText">正在檢查門狀態...</span>
+            </div>
+        </div>
         
         <div class="form-section">
             <h3>新增臨時密碼</h3>
@@ -129,6 +134,22 @@
         }
 
         function openDoor() {
+            const btn = document.getElementById('openDoorBtn');
+            const statusDiv = document.getElementById('doorStatus');
+            const statusText = document.getElementById('doorStatusText');
+            const mainStatus = document.getElementById('status');
+            
+            // 禁用按鈕，防止多次點擊
+            btn.disabled = true;
+            btn.style.opacity = '0.5';
+            
+            // 顯示狀態欄
+            statusDiv.style.display = 'block';
+            statusText.textContent = '正在開門...';
+            statusText.style.color = 'blue';
+            mainStatus.textContent = '';
+            
+            // 發送開門命令
             fetch('https://liunas2323.synology.me/api/open', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -137,16 +158,102 @@
             .then(res => res.json())
             .then(data => {
                 if (data.success) {
-                    document.getElementById('status').textContent = '門已開啟';
-                    document.getElementById('status').style.color = 'green';
+                    // 命令已發送，現在輪詢檢查門狀態
+                    statusText.textContent = '確認門狀態中...';
+                    checkDoorStatus(btn, statusDiv, statusText, mainStatus);
                 } else {
-                    document.getElementById('status').textContent = '開門失敗';
-                    document.getElementById('status').style.color = 'red';
+                    // 命令失敗
+                    statusText.textContent = '❌ 開門命令發送失敗';
+                    statusText.style.color = 'red';
+                    mainStatus.textContent = '開門失敗: ' + (data.message || '未知錯誤');
+                    mainStatus.style.color = 'red';
+                    btn.disabled = false;
+                    btn.style.opacity = '1';
                 }
             })
             .catch(err => {
-                document.getElementById('status').textContent = '開門請求失敗: ' + err;
-                document.getElementById('status').style.color = 'red';
+                statusText.textContent = '❌ 請求失敗';
+                statusText.style.color = 'red';
+                mainStatus.textContent = '開門請求失敗: ' + err;
+                mainStatus.style.color = 'red';
+                btn.disabled = false;
+                btn.style.opacity = '1';
+            });
+        }
+        
+        // 輪詢檢查門狀態 - 確認是否真的開門成功
+        function checkDoorStatus(btn, statusDiv, statusText, mainStatus, attempts = 0) {
+            const maxAttempts = 10;  // 最多嘗試 10 次
+            const checkInterval = 300;  // 每 300ms 檢查一次
+            
+            if (attempts >= maxAttempts) {
+                // 超過最大嘗試次數
+                statusText.textContent = '⚠️ 無法確認門狀態（已嘗試 10 次）';
+                statusText.style.color = 'orange';
+                mainStatus.textContent = '警告：無法確認門是否真的開啟，請驗證門的狀態';
+                mainStatus.style.color = 'orange';
+                btn.disabled = false;
+                btn.style.opacity = '1';
+                return;
+            }
+            
+            // 檢查門狀態
+            fetch('https://liunas2323.synology.me/api/door_status', {
+                method: 'GET',
+                headers: { 'Content-Type': 'application/json' }
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.success && data.is_open) {
+                    // ✅ 門已確認開啟
+                    statusText.textContent = '✅ 門已開啟';
+                    statusText.style.color = 'green';
+                    mainStatus.textContent = '開門成功！門已開啟 (' + data.reason + ')';
+                    mainStatus.style.color = 'green';
+                    btn.disabled = false;
+                    btn.style.opacity = '1';
+                } else if (data.success && !data.is_open) {
+                    // 門已經關上了（可能是設定的 3 秒時間已過）
+                    statusText.textContent = '✅ 門已開啟並自動關上';
+                    statusText.style.color = 'green';
+                    mainStatus.textContent = '開門成功！門開啟' + Math.floor(data.time_since_action_ms / 1000) + '秒後自動關上';
+                    mainStatus.style.color = 'green';
+                    btn.disabled = false;
+                    btn.style.opacity = '1';
+                } else {
+                    // 開門失敗
+                    if (attempts < 2) {
+                        // 前兩次可能是命令還未執行，繼續等待
+                        setTimeout(() => {
+                            statusText.textContent = '正在確認中... (' + (attempts + 1) + '/10)';
+                            checkDoorStatus(btn, statusDiv, statusText, mainStatus, attempts + 1);
+                        }, checkInterval);
+                    } else {
+                        // 多次嘗試後仍未成功
+                        statusText.textContent = '❌ 門開啟失敗';
+                        statusText.style.color = 'red';
+                        mainStatus.textContent = '開門失敗：伺服馬達未能正確執行';
+                        mainStatus.style.color = 'red';
+                        btn.disabled = false;
+                        btn.style.opacity = '1';
+                    }
+                }
+            })
+            .catch(err => {
+                // API 端點可能不存在或連線失敗
+                if (attempts < 2) {
+                    setTimeout(() => {
+                        statusText.textContent = '正在確認中... (' + (attempts + 1) + '/10)';
+                        checkDoorStatus(btn, statusDiv, statusText, mainStatus, attempts + 1);
+                    }, checkInterval);
+                } else {
+                    statusText.textContent = '❌ 無法檢查門狀態';
+                    statusText.style.color = 'red';
+                    mainStatus.textContent = '錯誤：無法連接到門鎖系統 (' + err + ')';
+                    mainStatus.style.color = 'red';
+                    btn.disabled = false;
+                    btn.style.opacity = '1';
+                }
             });
         }
 
