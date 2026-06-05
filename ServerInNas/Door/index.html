@@ -108,9 +108,25 @@
         </div>
     </div>
     <div id="status"></div>
-
+    <button onclick="logout()" style="margin: 20px; background: #f44336;">登出</button>
+        
     <script>
         let token = '';
+
+        document.addEventListener('DOMContentLoaded', initializeApp);
+
+        // 應用初始化 - 檢查是否已登入
+        function initializeApp() {
+            const savedToken = localStorage.getItem('doorToken');
+            if (savedToken) {
+                token = savedToken;
+                document.getElementById('login').style.display = 'none';
+                document.getElementById('control').style.display = 'block';
+            } else {
+                document.getElementById('login').style.display = 'block';
+                document.getElementById('control').style.display = 'none';
+            }
+        }
 
         function login() {
             const username = document.getElementById('username').value;
@@ -124,13 +140,31 @@
             .then(data => {
                 if (data.success) {
                     token = data.token;
+                    localStorage.setItem('doorToken', token);
                     document.getElementById('login').style.display = 'none';
                     document.getElementById('control').style.display = 'block';
-                    document.getElementById('status').textContent = '登入成功';
+                    document.getElementById('status').textContent = '登入成功，可以開門了';
+                    document.getElementById('status').style.color = 'green';
                 } else {
-                    document.getElementById('status').textContent = '登入失敗';
+                    document.getElementById('status').textContent = '登入失敗：帳號或密碼錯誤';
+                    document.getElementById('status').style.color = 'red';
                 }
+            })
+            .catch(err => {
+                document.getElementById('status').textContent = '登入錯誤：' + err;
+                document.getElementById('status').style.color = 'red';
             });
+        }
+
+        function logout() {
+            localStorage.removeItem('doorToken');
+            token = '';
+            document.getElementById('login').style.display = 'block';
+            document.getElementById('control').style.display = 'none';
+            document.getElementById('username').value = '';
+            document.getElementById('password').value = '';
+            document.getElementById('status').textContent = '已登出';
+            document.getElementById('status').style.color = 'gray';
         }
 
         function openDoor() {
@@ -222,8 +256,7 @@
                     btn.style.opacity = '1';
                 } else {
                     // 開門失敗
-                    if (attempts < 2) {
-                        // 前兩次可能是命令還未執行，繼續等待
+                    if (attempts < maxAttempts) {
                         setTimeout(() => {
                             statusText.textContent = '正在確認中... (' + (attempts + 1) + '/10)';
                             checkDoorStatus(btn, statusDiv, statusText, mainStatus, attempts + 1);
@@ -241,9 +274,9 @@
             })
             .catch(err => {
                 // API 端點可能不存在或連線失敗
-                if (attempts < 2) {
+                if (attempts < maxAttempts) {
                     setTimeout(() => {
-                        statusText.textContent = '正在確認中... (' + (attempts + 1) + '/10)';
+                        statusText.textContent = '正在確認中... (' + (attempts + 1) + '/' + maxAttempts +')';
                         checkDoorStatus(btn, statusDiv, statusText, mainStatus, attempts + 1);
                     }, checkInterval);
                 } else {
