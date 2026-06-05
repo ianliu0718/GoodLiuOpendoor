@@ -256,8 +256,7 @@
                     btn.style.opacity = '1';
                 } else {
                     // 開門失敗
-                    if (attempts < 2) {
-                        // 前兩次可能是命令還未執行，繼續等待
+                    if (attempts < maxAttempts) {
                         setTimeout(() => {
                             statusText.textContent = '正在確認中... (' + (attempts + 1) + '/10)';
                             checkDoorStatus(btn, statusDiv, statusText, mainStatus, attempts + 1);
@@ -275,9 +274,9 @@
             })
             .catch(err => {
                 // API 端點可能不存在或連線失敗
-                if (attempts < 2) {
+                if (attempts < maxAttempts) {
                     setTimeout(() => {
-                        statusText.textContent = '正在確認中... (' + (attempts + 1) + '/10)';
+                        statusText.textContent = '正在確認中... (' + (attempts + 1) + '/' + maxAttempts +')';
                         checkDoorStatus(btn, statusDiv, statusText, mainStatus, attempts + 1);
                     }, checkInterval);
                 } else {

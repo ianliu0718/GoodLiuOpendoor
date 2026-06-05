@@ -1,4 +1,4 @@
-// v1.2.0 - 新增：網頁 Log 同步顯示
+// v1.2.2 - 新增：網頁 Log 同步顯示
 // ESP32 智慧門鎖主控程式
 // 功能：指紋辨識、密碼開鎖、遠端HTTP開鎖、MQTT遠端控制
 // 材料：ESP32 DEVKIT V1、AS608、4x4 Keypad、繼電器
@@ -51,11 +51,28 @@ const char* mqtt_user = "x7814778r"; // MQTT 使用者名稱
 const char* mqtt_pass = "19880718"; // MQTT 密碼
 const char* mqtt_topic = "door/open";
 const char* mqtt_topic_add_temp_pw = "door/add_temp_pw"; // 新增臨時密碼 topic
+const char* mqtt_topic_status = "door/status"; // 門鎖狀態 topic
 WiFiClient espClient;
 PubSubClient client(espClient);
 
+// 非同步處理 MQTT 要求的旗標（避免在 callback 做長時間阻塞）
+volatile bool pendingMqttOpen = false;
+String pendingMqttReason = "";
+
 // 使用 Preferences 替代 EEPROM
 Preferences preferences;
+
+// 將 PubSubClient 狀態碼轉成人可讀字串，方便 debug
+const char* mqttStateName(int state) {
+  switch(state) {
+    case -4: return "MQTT_CONNECTION_TIMEOUT";
+    case -3: return "MQTT_CONNECTION_LOST";
+    case -2: return "MQTT_CONNECT_FAILED";
+    case -1: return "MQTT_DISCONNECTED";
+    case 0: return "MQTT_CONNECTED";
+    default: return "MQTT_UNKNOWN";
+  }
+}
 
 // 日誌系統：固定大小環形緩衝區，避免長時間運行後累積過多記憶體
 static HardwareSerial &realSerial = ::Serial;
@@ -185,7 +202,8 @@ void safeServoAttach() {
     Serial.println("安全連接伺服馬達");
     lockServo.attach(SERVO_PIN, 500, 2400); // 修正脈衝寬度範圍，才能轉到180度
     servoAttached = true;
-    delay(500); // 等待穩定
+    // 等待穩定，同時處理 MQTT loop 以免斷線
+    mqttFriendlyDelay(500);
   }
 }
 
@@ -194,7 +212,16 @@ void safeServoDetach() {
     Serial.println("安全斷開伺服馬達");
     lockServo.detach();
     servoAttached = false;
-    delay(200); // 等待完全斷開
+    mqttFriendlyDelay(200);
+  }
+}
+
+// 在等待期間持續呼叫 client.loop() 來維持 MQTT 連線
+void mqttFriendlyDelay(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    if (client.connected()) client.loop();
+    delay(10);
   }
 }
 
@@ -379,7 +406,7 @@ void initMax7219() {
   // 清除顯示
   mx.clear();
   
-  delay(500);
+  mqttFriendlyDelay(500);
   
   Serial.println("MAX7219 初始化完成");
 }
@@ -409,7 +436,7 @@ void showTextOnLed(String text, int delayTime = 0) {
   
   // 只在需要阻塞時才 delay（啟動、結果顯示等）
   if (delayTime > 0) {
-    delay(delayTime);
+    mqttFriendlyDelay(delayTime);
   }
 }
 
@@ -448,7 +475,7 @@ void showversion(String text, int delayTime = 700) {
     mx.setColumn(i, pattern);
   }
   
-  delay(delayTime);
+  mqttFriendlyDelay(delayTime);
 }
 
 // 顯示密碼在 MAX7219（右對齊，最多8碼）- 優化版本
@@ -502,7 +529,7 @@ void initFingerprint() {
   
   // 初始化指紋機通訊
   fingerSerial.begin(57600, SERIAL_8N1, FINGER_RX, FINGER_TX);
-  delay(1000);
+  mqttFriendlyDelay(1000);
   
   if (finger.verifyPassword()) {
     Serial.println("指紋機連接成功");
@@ -541,7 +568,7 @@ void checkFingerprint() {
         finger.LEDcontrol(false);
         showResult('O'); // 顯示成功
         openLock();
-        delay(2000); // 防止重複觸發
+        mqttFriendlyDelay(2000); // 防止重複觸發
       } else {
         Serial.println("指紋不符");
         finger.LEDcontrol(false);
@@ -582,7 +609,7 @@ bool enrollFingerprint(int id) {
   }
   
   Serial.print("請再次放上手指...");
-  delay(2000);
+  mqttFriendlyDelay(2000);
   
   if (finger.getImage() != FINGERPRINT_OK) {
     return false;
@@ -674,10 +701,11 @@ void connectToWiFi() {
     conStr +=  ".";
     showTextOnLed(conStr, 1000);
     Serial.print(".");
-    delay(6000);
+    mqttFriendlyDelay(6000);
     retries++;
   }
   if (WiFi.status() == WL_CONNECTED) {
+    inSetupMode = false;
     Serial.println("\nWiFi 連線成功");
     Serial.print("IP: ");
     Serial.println(WiFi.localIP());
@@ -732,7 +760,7 @@ void handleSave() {
   writeStringToPreferences("ssid", server.arg("ssid"));
   writeStringToPreferences("pass", server.arg("pass"));
   server.send(200, "text/plain", "設定已儲存，將重啟...");
-  delay(1000);
+  mqttFriendlyDelay(1000);
   ESP.restart();
 }
 
@@ -911,7 +939,7 @@ int addTempPassword(String pw, String expireStr = "", int count = -1) {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n\n=== ESP32 智慧門鎖 v1.2.0 ===");
+  Serial.println("\n\n=== ESP32 智慧門鎖 v1.2.2 ===");
   Serial.println("版本說明: 優化密碼輸入延遲、改進LED非阻塞式顯示、加入WiFi自動重連");
   
   // 初始化診斷狀態
@@ -926,16 +954,16 @@ void setup() {
   Serial.println("初始化伺服馬達...");
   safeServoAttach();
   lockServo.write(45);
-  delay(1000);
+  mqttFriendlyDelay(1000);
   lockServo.write(0);   // 轉回0度（關鎖）
-  delay(1000);
+  mqttFriendlyDelay(1000);
   safeServoDetach();
 
   // 初始化 MAX7219
   initMax7219();
   
   // 簡單測試 MAX7219 是否工作
-  showversion("v1.2.0", 1000);
+  showversion("v1.2.2", 1000);
   clearDisplay();
   
   // 增加按鍵去抖動時間，嘗試解決鬼鍵問題
@@ -983,7 +1011,7 @@ void setup() {
   int retries = 0;
   showTextOnLed("ntP    ", 1000);
   while (time(nullptr) < 1000000000) {
-    delay(500);
+    mqttFriendlyDelay(500);
     Serial.print(".");
     retries++;
     if (retries >= 5){
@@ -1325,6 +1353,18 @@ void loop() {
   if (diag.http_server_running) {
     server.handleClient(); // 每個 loop 都要處理，避免客戶端超時
   }
+
+  // 處理來自 MQTT 的非同步開門請求（避免在 callback 中直接執行阻塞操作）
+  if (pendingMqttOpen) {
+    // 互斥取旗標
+    pendingMqttOpen = false;
+    String reason = pendingMqttReason;
+    pendingMqttReason = "";
+    Serial.println("處理非同步 MQTT 開門請求，來源: " + reason);
+    diag.last_door_action_reason = reason;
+    bool success = openLock();
+    if (success) showResult('O'); else showResult('E');
+  }
   
   // === WiFi 狀態監測與自動重連 ===
   bool currentWiFiStatus = (WiFi.status() == WL_CONNECTED);
@@ -1398,7 +1438,7 @@ bool checkAllPasswords(String input) {
   if (input == correct_password) {
     Serial.println("主密碼正確，準備開門");
     showResult('O'); // 顯示 O 代表 Open
-    delay(100); // 等待顯示穩定
+    mqttFriendlyDelay(100); // 等待顯示穩定
     Serial.println("開始執行開鎖動作");
     diag.last_door_action_reason = "密碼";
     bool success = openLock();
@@ -1435,7 +1475,7 @@ bool checkAllPasswords(String input) {
         }
         Serial.println("臨時密碼正確，準備開門");
         showResult('O'); // 顯示 O 代表 Open
-        delay(100); // 等待顯示穩定
+        mqttFriendlyDelay(100); // 等待顯示穩定
         Serial.println("開始執行開鎖動作");
         diag.last_door_action_reason = "臨時密碼";
         bool success = openLock();
@@ -1520,12 +1560,42 @@ bool openLock() {
     Serial.println("度（開鎖）");
     lockServo.write(servoOpenAngle); // 轉到設定角度（開鎖）
     Serial.println("開門");
-    delay(3000); // 開鎖3秒
+    // 發佈門開啟狀態給後端（含 timestamp ms）
+    {
+      unsigned long ts_ms = (unsigned long)getNow() * 1000UL;
+      String payload = "{";
+      payload += "\"is_open\":true,";
+      payload += "\"reason\":\"" + diag.last_door_action_reason + "\",";
+      payload += "\"timestamp\":" + String(ts_ms);
+      payload += "}";
+      if (client.connected()) {
+        client.publish(mqtt_topic_status, payload.c_str());
+        Serial.print("Published status (open): "); Serial.println(payload);
+      } else {
+        Serial.println("MQTT 未連線，無法發佈門開啟狀態");
+      }
+    }
+    mqttFriendlyDelay(3000); // 開鎖3秒，但在等待期間維持 MQTT loop
     
     Serial.println("3. 開始轉動到0度（關鎖）");
     lockServo.write(0);   // 轉回0度（關鎖）
     Serial.println("關門");
-    delay(1000); // 關鎖1秒
+    // 發佈門關閉狀態給後端
+    {
+      unsigned long ts_ms = (unsigned long)getNow() * 1000UL;
+      String payload = "{";
+      payload += "\"is_open\":false,";
+      payload += "\"reason\":\"" + diag.last_door_action_reason + "\",";
+      payload += "\"timestamp\":" + String(ts_ms);
+      payload += "}";
+      if (client.connected()) {
+        client.publish(mqtt_topic_status, payload.c_str());
+        Serial.print("Published status (closed): "); Serial.println(payload);
+      } else {
+        Serial.println("MQTT 未連線，無法發佈門關閉狀態");
+      }
+    }
+    mqttFriendlyDelay(1000); // 關鎖1秒，但在等待期間維持 MQTT loop
     
     Serial.println("4. 斷開伺服馬達連接");
     safeServoDetach();
@@ -1557,19 +1627,18 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
   message.trim(); // 去除前後空白字符
   Serial.println(message);
+  Serial.print("[MQTT DEBUG] client.connected(): "); Serial.println(client.connected() ? "true" : "false");
+  Serial.print("[MQTT DEBUG] client.state(): "); Serial.print(client.state()); Serial.print(" "); Serial.println(mqttStateName(client.state()));
   
   String topicStr = String(topic);
   
-  // 處理開門訊號
+  // 處理開門訊號 — 非同步處理：在 callback 中只設定旗標，真正的開門動作在 loop() 執行
   if (topicStr == mqtt_topic && message == "open") {
-    Serial.println("收到開門訊號，執行開門動作");
-    diag.last_door_action_reason = "MQTT";
-    bool success = openLock();
-    if (success) {
-      showResult('O'); // 顯示成功
-    } else {
-      showResult('E'); // 顯示失敗
-    }
+    Serial.println("收到開門訊號，排入非同步處理");
+    // 設定旗標，稍後在 loop() 中處理，避免在 callback 內呼叫會阻塞的 openLock()
+    pendingMqttOpen = true;
+    pendingMqttReason = "MQTT";
+    return;
   }
   // 處理新增臨時密碼
   else if (topicStr == mqtt_topic_add_temp_pw) {
@@ -1625,9 +1694,14 @@ void reconnectMQTT() {
   // 防止無限重連：每次嘗試最多2次，間隔5秒
   int attemptCount = 0;
   const int MAX_ATTEMPTS = 2;
-  
+
+  Serial.print("[MQTT] Current state before connect: "); Serial.print(client.state()); Serial.print(" "); Serial.println(mqttStateName(client.state()));
+  Serial.print("[MQTT] Local IP: "); Serial.println(WiFi.localIP());
+  Serial.print("[MQTT] Free heap: "); Serial.println(ESP.getFreeHeap());
+
   while (!client.connected() && attemptCount < MAX_ATTEMPTS) {
     attemptCount++;
+    String clientId = String("ESP32_Door_") + String(WiFi.macAddress());
     Serial.print("[MQTT] 嘗試連接 (");
     Serial.print(attemptCount);
     Serial.print("/");
@@ -1635,37 +1709,43 @@ void reconnectMQTT() {
     Serial.print(") 至 ");
     Serial.print(mqtt_server);
     Serial.print(":");
-    Serial.println(mqtt_port);
-    
-    if (client.connect("ESP32_Door", mqtt_user, mqtt_pass)) {
+    Serial.print(mqtt_port);
+    Serial.println(" 使用 clientId="); Serial.println(clientId);
+
+    if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
       Serial.println("[MQTT] ✅ 連接成功");
       diag.mqtt_connected = true;
-      
+
       // 訂閱主題
       Serial.print("[MQTT] 訂閱 topic: ");
       Serial.println(mqtt_topic);
-      client.subscribe(mqtt_topic);
-      
+      if (!client.subscribe(mqtt_topic)) Serial.println("[MQTT] ⚠️ subscribe failed: " + String(mqtt_topic));
+
       Serial.print("[MQTT] 訂閱 topic: ");
       Serial.println(mqtt_topic_add_temp_pw);
-      client.subscribe(mqtt_topic_add_temp_pw);
-      
+      if (!client.subscribe(mqtt_topic_add_temp_pw)) Serial.println("[MQTT] ⚠️ subscribe failed: " + String(mqtt_topic_add_temp_pw));
+
+      // 訂閱狀態回報 topic（若需要）
+      Serial.print("[MQTT] 訂閱 topic: "); Serial.println(mqtt_topic_status);
+      if (!client.subscribe(mqtt_topic_status)) Serial.println("[MQTT] ⚠️ subscribe failed: " + String(mqtt_topic_status));
+
       return;
     } else {
+      int st = client.state();
       Serial.print("[MQTT] ❌ 連接失敗，狀態碼: ");
-      Serial.println(client.state());
+      Serial.print(st); Serial.print(" "); Serial.println(mqttStateName(st));
       diag.mqtt_connected = false;
-      
+
       if (attemptCount < MAX_ATTEMPTS) {
         Serial.println("[MQTT] 5秒後重試...");
-        delay(5000);
+        mqttFriendlyDelay(5000);
       }
     }
   }
-  
+
   if (!client.connected()) {
     Serial.println("[MQTT] ⚠️ 已達重試上限，將於下次 loop 重新嘗試");
   }
 }
 
-// v1.2.0 - 新增：網頁 Log 同步顯示
+// v1.2.2 - 新增：網頁 Log 同步顯示
