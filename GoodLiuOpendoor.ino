@@ -1,4 +1,4 @@
-// v1.2.4 - 優化：MQTT重新連線時會阻塞流程
+// v1.2.3 - 優化：MQTT重新連線時會阻塞流程
 // ESP32 智慧門鎖主控程式
 // 功能：指紋辨識、密碼開鎖、遠端HTTP開鎖、MQTT遠端控制
 // 材料：ESP32 DEVKIT V1、AS608、4x4 Keypad、繼電器
@@ -941,7 +941,7 @@ int addTempPassword(String pw, String expireStr = "", int count = -1) {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n\n=== ESP32 智慧門鎖 v1.2.4 ===");
+  Serial.println("\n\n=== ESP32 智慧門鎖 v1.2.3 ===");
   Serial.println("版本說明: 優化密碼輸入延遲、改進LED非阻塞式顯示、加入WiFi自動重連");
   
   // 初始化診斷狀態
@@ -965,7 +965,7 @@ void setup() {
   initMax7219();
   
   // 簡單測試 MAX7219 是否工作
-  showversion("v1.2.4", 1000);
+  showversion("v1.2.3", 1000);
   clearDisplay();
   
   // 增加按鍵去抖動時間，嘗試解決鬼鍵問題
@@ -1758,4 +1758,4 @@ void reconnectMQTT() {
   Serial.println("[MQTT] 單次連線失敗，下次 loop 再嘗試");
 }
 
-// v1.2.4 - 優化：MQTT重新連線時會阻塞流程
+// v1.2.3 - 優化：MQTT重新連線時會阻塞流程
