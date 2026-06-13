@@ -1,4 +1,4 @@
-// v1.2.2 - 新增：網頁 Log 同步顯示
+// v1.2.3 - 優化：MQTT重新連線時會阻塞流程
 // ESP32 智慧門鎖主控程式
 // 功能：指紋辨識、密碼開鎖、遠端HTTP開鎖、MQTT遠端控制
 // 材料：ESP32 DEVKIT V1、AS608、4x4 Keypad、繼電器
@@ -58,6 +58,8 @@ PubSubClient client(espClient);
 // 非同步處理 MQTT 要求的旗標（避免在 callback 做長時間阻塞）
 volatile bool pendingMqttOpen = false;
 String pendingMqttReason = "";
+String pendingMqttRequestId = ""; // 來自 MQTT 的 requestId
+String currentOpenRequestId = ""; // 當前正在處理的開門 requestId
 
 // 使用 Preferences 替代 EEPROM
 Preferences preferences;
@@ -939,7 +941,7 @@ int addTempPassword(String pw, String expireStr = "", int count = -1) {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n\n=== ESP32 智慧門鎖 v1.2.2 ===");
+  Serial.println("\n\n=== ESP32 智慧門鎖 v1.2.3 ===");
   Serial.println("版本說明: 優化密碼輸入延遲、改進LED非阻塞式顯示、加入WiFi自動重連");
   
   // 初始化診斷狀態
@@ -963,7 +965,7 @@ void setup() {
   initMax7219();
   
   // 簡單測試 MAX7219 是否工作
-  showversion("v1.2.2", 1000);
+  showversion("v1.2.3", 1000);
   clearDisplay();
   
   // 增加按鍵去抖動時間，嘗試解決鬼鍵問題
@@ -1349,6 +1351,9 @@ unsigned long lastWiFiReconnectAttempt = 0;
 const unsigned long WIFI_RECONNECT_INTERVAL = 10000; // WiFi 每10秒嘗試一次重連
 
 void loop() {
+  //若未設定好，則等待設定
+  if (inSetupMode) return;
+
   // === 持續處理 HTTP 請求（必須頻繁調用避免阻塞） ===
   if (diag.http_server_running) {
     server.handleClient(); // 每個 loop 都要處理，避免客戶端超時
@@ -1360,38 +1365,41 @@ void loop() {
     pendingMqttOpen = false;
     String reason = pendingMqttReason;
     pendingMqttReason = "";
-    Serial.println("處理非同步 MQTT 開門請求，來源: " + reason);
+    // 取得並清除 pending requestId，傳給 openLock
+    currentOpenRequestId = pendingMqttRequestId;
+    pendingMqttRequestId = "";
+    Serial.println("處理非同步 MQTT 開門請求，來源: " + reason + " requestId:" + currentOpenRequestId);
     diag.last_door_action_reason = reason;
     bool success = openLock();
     if (success) showResult('O'); else showResult('E');
+    // 處理完畢後清除 currentOpenRequestId
+    currentOpenRequestId = "";
   }
   
   // === WiFi 狀態監測與自動重連 ===
   bool currentWiFiStatus = (WiFi.status() == WL_CONNECTED);
   
-  if (!inSetupMode) {
-    if (!currentWiFiStatus) {
-      // WiFi 已斷線，嘗試重連（每10秒最多一次）
-      if (millis() - lastWiFiReconnectAttempt > WIFI_RECONNECT_INTERVAL) {
-        Serial.println("[WiFi] ⚠️ WiFi 已斷開，嘗試重新連接...");
-        WiFi.reconnect();  // ESP32 WiFi 函式，自動使用已保存的 SSID/Password
-        lastWiFiReconnectAttempt = millis();
-      }
-    } else if (!diag.wifi_connected) {
-      // WiFi 剛連上（從斷線狀態恢復）
-      Serial.println("[WiFi] ✅ WiFi 已重新連接");
-      // 立即嘗試重連 MQTT
-      if (!client.connected()) {
-        Serial.println("[WiFi] 觸發 MQTT 重連");
-        diag.last_mqtt_attempt = 0;  // 重置 MQTT 重連計時器，立即嘗試
-      }
+  if (!currentWiFiStatus) {
+    // WiFi 已斷線，嘗試重連（每10秒最多一次）
+    if (millis() - lastWiFiReconnectAttempt > WIFI_RECONNECT_INTERVAL) {
+      Serial.println("[WiFi] ⚠️ WiFi 已斷開，嘗試重新連接...");
+      WiFi.reconnect();  // ESP32 WiFi 函式，自動使用已保存的 SSID/Password
+      lastWiFiReconnectAttempt = millis();
+    }
+  } else if (!diag.wifi_connected) {
+    // WiFi 剛連上（從斷線狀態恢復）
+    Serial.println("[WiFi] ✅ WiFi 已重新連接");
+    // 立即嘗試重連 MQTT
+    if (!client.connected()) {
+      Serial.println("[WiFi] 觸發 MQTT 重連");
+      diag.last_mqtt_attempt = 0;  // 重置 MQTT 重連計時器，立即嘗試
     }
   }
   
   diag.wifi_connected = currentWiFiStatus;
   
   // === MQTT 連線管理（改進版，避免無限重試） ===
-  if (!inSetupMode && diag.wifi_connected) {
+  if (diag.wifi_connected) {
     // 定期檢查 MQTT 連線，如果斷開則嘗試重連（每5秒最多一次）
     if (!client.connected() && (millis() - diag.last_mqtt_attempt > 5000)) {
       Serial.println("[MQTT] 連線已斷開，嘗試重連...");
@@ -1408,8 +1416,6 @@ void loop() {
       diag.mqtt_connected = false;
     }
   }
-  
-  if (inSetupMode) return;
   
   // 檢查指紋辨識
   if (fingerAvailable && inFingerRun) {
@@ -1567,6 +1573,9 @@ bool openLock() {
       payload += "\"is_open\":true,";
       payload += "\"reason\":\"" + diag.last_door_action_reason + "\",";
       payload += "\"timestamp\":" + String(ts_ms);
+      if (currentOpenRequestId.length() > 0) {
+        payload += ",\"id\":\"" + currentOpenRequestId + "\"";
+      }
       payload += "}";
       if (client.connected()) {
         client.publish(mqtt_topic_status, payload.c_str());
@@ -1587,6 +1596,9 @@ bool openLock() {
       payload += "\"is_open\":false,";
       payload += "\"reason\":\"" + diag.last_door_action_reason + "\",";
       payload += "\"timestamp\":" + String(ts_ms);
+      if (currentOpenRequestId.length() > 0) {
+        payload += ",\"id\":\"" + currentOpenRequestId + "\"";
+      }
       payload += "}";
       if (client.connected()) {
         client.publish(mqtt_topic_status, payload.c_str());
@@ -1632,13 +1644,31 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   
   String topicStr = String(topic);
   
-  // 處理開門訊號 — 非同步處理：在 callback 中只設定旗標，真正的開門動作在 loop() 執行
-  if (topicStr == mqtt_topic && message == "open") {
-    Serial.println("收到開門訊號，排入非同步處理");
-    // 設定旗標，稍後在 loop() 中處理，避免在 callback 內呼叫會阻塞的 openLock()
-    pendingMqttOpen = true;
-    pendingMqttReason = "MQTT";
-    return;
+  // 處理開門訊號 — 支援舊版 plain "open" 與新版 JSON {"cmd":"open","id":"..."}
+  if (topicStr == mqtt_topic) {
+    // 先嘗試解析為 JSON
+    DynamicJsonDocument doc(256);
+    DeserializationError err = deserializeJson(doc, message);
+    if (!err && doc.containsKey("cmd") && String(doc["cmd"].as<const char*>()) == "open") {
+      Serial.println("收到 JSON 開門訊號");
+      pendingMqttOpen = true;
+      pendingMqttReason = "MQTT";
+      if (doc.containsKey("id")) {
+        pendingMqttRequestId = String(doc["id"].as<const char*>());
+        Serial.print("儲存 pending requestId: "); Serial.println(pendingMqttRequestId);
+      } else {
+        pendingMqttRequestId = "";
+      }
+      return;
+    }
+    // 若非 JSON，檢查是否為舊版 plain text "open"
+    if (message == "open") {
+      Serial.println("收到 plain text 開門訊號，排入非同步處理");
+      pendingMqttOpen = true;
+      pendingMqttReason = "MQTT";
+      pendingMqttRequestId = "";
+      return;
+    }
   }
   // 處理新增臨時密碼
   else if (topicStr == mqtt_topic_add_temp_pw) {
@@ -1691,61 +1721,41 @@ void reconnectMQTT() {
     return;
   }
   
-  // 防止無限重連：每次嘗試最多2次，間隔5秒
-  int attemptCount = 0;
-  const int MAX_ATTEMPTS = 2;
-
   Serial.print("[MQTT] Current state before connect: "); Serial.print(client.state()); Serial.print(" "); Serial.println(mqttStateName(client.state()));
   Serial.print("[MQTT] Local IP: "); Serial.println(WiFi.localIP());
   Serial.print("[MQTT] Free heap: "); Serial.println(ESP.getFreeHeap());
 
-  while (!client.connected() && attemptCount < MAX_ATTEMPTS) {
-    attemptCount++;
-    String clientId = String("ESP32_Door_") + String(WiFi.macAddress());
-    Serial.print("[MQTT] 嘗試連接 (");
-    Serial.print(attemptCount);
-    Serial.print("/");
-    Serial.print(MAX_ATTEMPTS);
-    Serial.print(") 至 ");
-    Serial.print(mqtt_server);
-    Serial.print(":");
-    Serial.print(mqtt_port);
-    Serial.println(" 使用 clientId="); Serial.println(clientId);
+  String clientId = String("ESP32_Door_") + String(WiFi.macAddress());
+  Serial.print("[MQTT] 嘗試連接至 ");
+  Serial.print(mqtt_server);
+  Serial.print(":");
+  Serial.print(mqtt_port);
+  Serial.print(" 使用 clientId="); Serial.println(clientId);
 
-    if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
-      Serial.println("[MQTT] ✅ 連接成功");
-      diag.mqtt_connected = true;
+  if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
+    Serial.println("[MQTT] ✅ 連接成功");
+    diag.mqtt_connected = true;
 
-      // 訂閱主題
-      Serial.print("[MQTT] 訂閱 topic: ");
-      Serial.println(mqtt_topic);
-      if (!client.subscribe(mqtt_topic)) Serial.println("[MQTT] ⚠️ subscribe failed: " + String(mqtt_topic));
+    // 訂閱主題
+    Serial.print("[MQTT] 訂閱 topic: ");
+    Serial.println(mqtt_topic);
+    if (!client.subscribe(mqtt_topic)) Serial.println("[MQTT] ⚠️ subscribe failed: " + String(mqtt_topic));
 
-      Serial.print("[MQTT] 訂閱 topic: ");
-      Serial.println(mqtt_topic_add_temp_pw);
-      if (!client.subscribe(mqtt_topic_add_temp_pw)) Serial.println("[MQTT] ⚠️ subscribe failed: " + String(mqtt_topic_add_temp_pw));
+    Serial.print("[MQTT] 訂閱 topic: ");
+    Serial.println(mqtt_topic_add_temp_pw);
+    if (!client.subscribe(mqtt_topic_add_temp_pw)) Serial.println("[MQTT] ⚠️ subscribe failed: " + String(mqtt_topic_add_temp_pw));
 
-      // 訂閱狀態回報 topic（若需要）
-      Serial.print("[MQTT] 訂閱 topic: "); Serial.println(mqtt_topic_status);
-      if (!client.subscribe(mqtt_topic_status)) Serial.println("[MQTT] ⚠️ subscribe failed: " + String(mqtt_topic_status));
-
-      return;
-    } else {
-      int st = client.state();
-      Serial.print("[MQTT] ❌ 連接失敗，狀態碼: ");
-      Serial.print(st); Serial.print(" "); Serial.println(mqttStateName(st));
-      diag.mqtt_connected = false;
-
-      if (attemptCount < MAX_ATTEMPTS) {
-        Serial.println("[MQTT] 5秒後重試...");
-        mqttFriendlyDelay(5000);
-      }
-    }
+    // 訂閱狀態回報 topic（若需要）
+    Serial.print("[MQTT] 訂閱 topic: "); Serial.println(mqtt_topic_status);
+    if (!client.subscribe(mqtt_topic_status)) Serial.println("[MQTT] ⚠️ subscribe failed: " + String(mqtt_topic_status));
+    return;
   }
 
-  if (!client.connected()) {
-    Serial.println("[MQTT] ⚠️ 已達重試上限，將於下次 loop 重新嘗試");
-  }
+  int st = client.state();
+  Serial.print("[MQTT] ❌ 連接失敗，狀態碼: ");
+  Serial.print(st); Serial.print(" "); Serial.println(mqttStateName(st));
+  diag.mqtt_connected = false;
+  Serial.println("[MQTT] 單次連線失敗，下次 loop 再嘗試");
 }
 
-// v1.2.2 - 新增：網頁 Log 同步顯示
+// v1.2.3 - 優化：MQTT重新連線時會阻塞流程

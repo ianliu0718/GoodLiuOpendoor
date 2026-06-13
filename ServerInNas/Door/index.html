@@ -122,6 +122,17 @@
                 token = savedToken;
                 document.getElementById('login').style.display = 'none';
                 document.getElementById('control').style.display = 'block';
+                
+                // 檢查 URL 參數，支持自動開門
+                const urlParams = new URLSearchParams(window.location.search);
+                const action = urlParams.get('action');
+                if (action === 'open') {
+                    // 延遲執行，確保 DOM 已準備好
+                    setTimeout(() => {
+                        console.log('檢測到自動開門參數，執行開門...');
+                        openDoor();
+                    }, 100);
+                }
             } else {
                 document.getElementById('login').style.display = 'block';
                 document.getElementById('control').style.display = 'none';
@@ -131,27 +142,36 @@
         function login() {
             const username = document.getElementById('username').value;
             const password = document.getElementById('password').value;
+            console.log('嘗試登入，用戶名:', username);
             fetch('https://liunas2323.synology.me/api/login', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ username, password })
             })
-            .then(res => res.json())
+            .then(res => {
+                console.log('登入回應狀態碼:', res.status);
+                return res.json();
+            })
             .then(data => {
+                console.log('登入回應數據:', data);
                 if (data.success) {
                     token = data.token;
                     localStorage.setItem('doorToken', token);
                     document.getElementById('login').style.display = 'none';
                     document.getElementById('control').style.display = 'block';
+                    console.log('登入成功！');
                     document.getElementById('status').textContent = '登入成功，可以開門了';
                     document.getElementById('status').style.color = 'green';
                 } else {
-                    document.getElementById('status').textContent = '登入失敗：帳號或密碼錯誤';
+                    const errorMsg = data.message || '帳號或密碼錯誤';
+                    document.getElementById('status').textContent = '登入失敗：' + errorMsg;
                     document.getElementById('status').style.color = 'red';
+                    console.error('登入失敗:', errorMsg);
                 }
             })
             .catch(err => {
-                document.getElementById('status').textContent = '登入錯誤：' + err;
+                console.error('登入請求異常:', err);
+                document.getElementById('status').textContent = '登入連接失敗，請檢查網路：' + err.message;
                 document.getElementById('status').style.color = 'red';
             });
         }
@@ -184,31 +204,40 @@
             mainStatus.textContent = '';
             
             // 發送開門命令
+            console.log('發送開門請求，Token長度:', token.length);
             fetch('https://liunas2323.synology.me/api/open', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ token })
             })
-            .then(res => res.json())
+            .then(res => {
+                console.log('伺服器回應狀態碼:', res.status);
+                return res.json();
+            })
             .then(data => {
+                console.log('伺服器回應數據:', data);
                 if (data.success) {
-                    // 命令已發送，現在輪詢檢查門狀態
+                    // 命令已發送，取得 requestId，現在輪詢檢查門狀態（比對 requestId）
+                    const requestId = data.requestId || null;
                     statusText.textContent = '確認門狀態中...';
-                    checkDoorStatus(btn, statusDiv, statusText, mainStatus);
+                    checkDoorStatus(btn, statusDiv, statusText, mainStatus, requestId);
                 } else {
                     // 命令失敗
                     statusText.textContent = '❌ 開門命令發送失敗';
                     statusText.style.color = 'red';
-                    mainStatus.textContent = '開門失敗: ' + (data.message || '未知錯誤');
+                    const errorMsg = data.message || data.error || '未知錯誤';
+                    mainStatus.textContent = '開門失敗: ' + errorMsg;
                     mainStatus.style.color = 'red';
+                    console.error('開門失敗原因:', errorMsg);
                     btn.disabled = false;
                     btn.style.opacity = '1';
                 }
             })
             .catch(err => {
-                statusText.textContent = '❌ 請求失敗';
+                console.error('開門請求異常:', err);
+                statusText.textContent = '❌ 網路連接失敗';
                 statusText.style.color = 'red';
-                mainStatus.textContent = '開門請求失敗: ' + err;
+                mainStatus.textContent = '開門連接失敗，請檢查網路：' + err.message;
                 mainStatus.style.color = 'red';
                 btn.disabled = false;
                 btn.style.opacity = '1';
@@ -216,7 +245,7 @@
         }
         
         // 輪詢檢查門狀態 - 確認是否真的開門成功
-        function checkDoorStatus(btn, statusDiv, statusText, mainStatus, attempts = 0) {
+        function checkDoorStatus(btn, statusDiv, statusText, mainStatus, requestId = null, attempts = 0) {
             const maxAttempts = 10;  // 最多嘗試 10 次
             const checkInterval = 300;  // 每 300ms 檢查一次
             
@@ -238,8 +267,18 @@
             })
             .then(res => res.json())
             .then(data => {
-                if (data.success && data.is_open) {
-                    // ✅ 門已確認開啟
+                // 若有 requestId，只有當回傳 reported_id 與 requestId 相符且 is_open 為 true 才視為成功
+                const reported = data.reported_id || null;
+                if (data.success && reported && requestId && reported === requestId && data.is_open) {
+                    // ✅ 門已確認開啟（由此次 requestId 回傳）
+                    statusText.textContent = '✅ 門已開啟';
+                    statusText.style.color = 'green';
+                    mainStatus.textContent = '開門成功！門已開啟 (' + data.reason + ')';
+                    mainStatus.style.color = 'green';
+                    btn.disabled = false;
+                    btn.style.opacity = '1';
+                } else if (data.success && data.is_open && !requestId) {
+                    // 無 requestId 檢查的情況（相容舊流程）
                     statusText.textContent = '✅ 門已開啟';
                     statusText.style.color = 'green';
                     mainStatus.textContent = '開門成功！門已開啟 (' + data.reason + ')';
@@ -259,7 +298,7 @@
                     if (attempts < maxAttempts) {
                         setTimeout(() => {
                             statusText.textContent = '正在確認中... (' + (attempts + 1) + '/10)';
-                            checkDoorStatus(btn, statusDiv, statusText, mainStatus, attempts + 1);
+                            checkDoorStatus(btn, statusDiv, statusText, mainStatus, requestId, attempts + 1);
                         }, checkInterval);
                     } else {
                         // 多次嘗試後仍未成功
@@ -277,7 +316,7 @@
                 if (attempts < maxAttempts) {
                     setTimeout(() => {
                         statusText.textContent = '正在確認中... (' + (attempts + 1) + '/' + maxAttempts +')';
-                        checkDoorStatus(btn, statusDiv, statusText, mainStatus, attempts + 1);
+                        checkDoorStatus(btn, statusDiv, statusText, mainStatus, requestId, attempts + 1);
                     }, checkInterval);
                 } else {
                     statusText.textContent = '❌ 無法檢查門狀態';
@@ -347,20 +386,24 @@
             })
             .then(res => res.json())
             .then(data => {
+                console.log('新增密碼回應:', data);
                 if (data.success) {
-                    document.getElementById('status').textContent = '臨時密碼新增成功！';
+                    document.getElementById('status').textContent = '✅ 臨時密碼新增成功！';
                     document.getElementById('status').style.color = 'green';
                     // 清空表單
                     document.getElementById('tempPw').value = '';
                     document.getElementById('expireTime').value = '';
                     document.getElementById('useCount').value = '';
                 } else {
-                    document.getElementById('status').textContent = '新增失敗: ' + (data.error || '未知錯誤');
+                    const errorMsg = data.message || data.error || '未知錯誤';
+                    document.getElementById('status').textContent = '❌ 新增失敗: ' + errorMsg;
                     document.getElementById('status').style.color = 'red';
+                    console.error('新增密碼失敗:', errorMsg);
                 }
             })
             .catch(err => {
-                document.getElementById('status').textContent = '請求失敗: ' + err;
+                console.error('新增密碼請求失敗:', err);
+                document.getElementById('status').textContent = '❌ 連接失敗: ' + err.message;
                 document.getElementById('status').style.color = 'red';
             });
         }
